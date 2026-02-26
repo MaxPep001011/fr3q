@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.sh
+.env
+venv/
+.venv/
+storage
+.pytest_cache/
+**/*.rs.bk
+*.dat
+*.json
+*.log
+makefile
+makefile (p)
+TODO
+crypto/target

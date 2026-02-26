@@ -1,0 +1,563 @@
+import curses
+import time
+import re
+import os
+from ui.input import TextInput, RichLine
+
+class BaseScreen:
+    """Interface for all screens"""
+    def __init__(self, stdscr, engine):
+        self.stdscr = stdscr
+        self.engine = engine
+        self.height, self.width = stdscr.getmaxyx()
+
+    def resize(self):
+        self.height, self.width = self.stdscr.getmaxyx()
+
+    def draw(self):
+        """Main render loop for this screen"""
+        pass
+
+    def handle_input(self, key):
+        """
+        Main input handler.
+        Returns: None (usually), or a new Screen instance to switch context.
+        """
+        pass
+
+class LockScreen(BaseScreen):
+    
+    def __init__(self, stdscr, engine):
+        super().__init__(stdscr, engine)
+        self.NEW_ACCOUNT_STR = "CREATE NEW"
+        curses.curs_set(0)
+        # inputs
+        self.name_box = TextInput(prompt="Account Name: ", password=False)
+        self.passwd_box = TextInput(prompt="Password: ", password=True)
+        
+        # initial state
+        accounts = self.engine.vault_names()
+        self.is_setup = len(accounts) == 0
+        default_acc = False
+        if self.engine.acc_name:
+            default_acc = self.engine.acc_name
+        if not default_acc and self.engine.sys_config.get("default_acc"):
+            if engine.vault_exists(self.engine.sys_config.get("default_acc")):
+                default_acc = self.engine.sys_config.get("default_acc")
+        
+        # initial focus
+        self.focus_box = self.name_box
+        self.show_acc_switcher = (not self.is_setup and not default_acc)
+        self.switcher_idx = 0
+        
+        if self.is_setup:
+            self.msg = "CREATE NEW VAULT"
+        else:
+            self.msg = "LOCKED"
+            if default_acc:
+                # Pre-fill name and jump to password
+                self.engine.set_account(default_acc)
+                self.name_box.buffer = list(default_acc)
+                self.focus_box = self.passwd_box
+
+    def handle_input(self, key):
+        if key == 9:
+            #TAB
+            if not self.is_setup:
+                self.show_acc_switcher = True
+            else:
+                # Setup mode
+                self.focus_box = self.passwd_box if self.focus_box == self.name_box else self.name_box
+            return
+        elif key == 27:
+            #ESC
+            return "QUIT"
+
+        if self.show_acc_switcher:
+            #account switcher
+            names = self.engine.vault_names() + [self.NEW_ACCOUNT_STR]
+            if key == curses.KEY_UP:
+                self.switcher_idx = (self.switcher_idx - 1) % len(names)
+            elif key == curses.KEY_DOWN:
+                self.switcher_idx = (self.switcher_idx + 1) % len(names)
+            elif key in (10, 13, curses.KEY_ENTER):
+                selection = names[self.switcher_idx]
+                if selection == self.NEW_ACCOUNT_STR:
+                    self.is_setup = True
+                    self.focus_box = self.name_box
+                    self.msg = "CREATE VAULT"
+                    self.name_box.reset()
+                else:
+                    self.engine.set_account(selection)
+                    self.name_box.buffer = list(selection)
+                    self.is_setup = False
+                    self.focus_box = self.passwd_box
+                    self.msg = "LOCKED"
+                self.show_acc_switcher = False
+            self.passwd_box.reset()
+            return
+
+        result = self.focus_box.handle_key(key)
+        if isinstance(result, str): # Enter was pressed in the focused box
+            acc_name = self.name_box.get_text()
+            password = self.passwd_box.get_text()
+            #Check unique name and allowed chars
+            if self.check_name(acc_name):
+                if self.is_setup:
+                    if self.engine.vault_exists(acc_name):
+                        self.msg = f"'{acc_name}' ALREADY TAKEN"
+                        self.focus_box = self.name_box
+                        return
+                    #Create account
+                    self.msg = f"CREATING {acc_name}..."
+                    self.engine.acc_name = acc_name
+                    self.engine.create_account(password)
+                    self.is_setup = False
+                    self.show_acc_switcher = True
+                else:
+                    #Attempt login
+                    self.msg = "DECRYPTING..."
+                    if self.engine.login(acc_name, password):
+                        return ChatScreen(self.stdscr, self.engine)
+                    else:
+                        self.msg = "DECRYPTION ERROR"
+                        self.passwd_box.reset()
+            else:
+                self.name_box.reset()
+                self.passwd_box.reset()
+                return
+
+    def check_name(self, name: str):
+        if not name.strip():
+            self.msg = "ACCOUNT NAME REQUIRED"
+            self.focus_box = self.name_box
+            return 0
+        if re.search(r'[^a-zA-Z0-9_-]', name):
+            self.msg = "NAME CANNOT HAVE SPACES OR SPECIAL CHARS"
+            self.focus_box = self.name_box
+            return 0
+        return 1
+    def draw(self):
+        self.stdscr.clear()
+        cy, cx = self.height // 2, self.width // 2
+        
+        # title
+        title = "VAULT SETUP" if self.is_setup else "FR3Q VAULT"
+        self.stdscr.addstr(cy - 6, cx - len(title)//2, title, curses.A_BOLD)
+
+        self.stdscr.addstr(cy - 2, cx - len(self.msg)//2, self.msg, curses.color_pair(2))
+        vpath = self.engine._get_vault_path(self.name_box.get_text() or "*")
+        if self.show_acc_switcher:
+            #draw acc switcher
+            self.draw_acc_switcher()
+            self.stdscr.addstr(self.height-1, 0, "ESC: Quit", curses.color_pair(25))
+        else:
+            if self.is_setup:
+                # name box
+                self.name_box.draw(self.stdscr, cy, cx - 15, 30, 8)
+                if self.focus_box == self.name_box:
+                    # Highlight prompt
+                    self.stdscr.addstr(cy, cx - 15, self.name_box.prompt, curses.color_pair(16) | curses.A_BOLD)
+                self.stdscr.addstr(self.height-1, 0, "TAB: Switch Field | ESC: Quit", curses.color_pair(25))
+            else:
+                self.stdscr.addstr(self.height-1, 0, "TAB: Switch Account | ESC: Quit", curses.color_pair(25))
+            self.stdscr.addstr(cy - 4, cx - 18, vpath[-36:], curses.color_pair(13))
+            # password box
+            pass_y = cy + 2 if self.is_setup else cy
+            self.passwd_box.draw(self.stdscr, pass_y, cx - 11, 30, 8, 8)
+            if self.focus_box == self.passwd_box:
+                # Highlight prompt
+                self.stdscr.addstr(pass_y, cx - 11, self.passwd_box.prompt, curses.color_pair(16) | curses.A_BOLD)
+        
+            
+    def draw_acc_switcher(self):
+        names = self.engine.vault_names() + [self.NEW_ACCOUNT_STR]
+        h, w = len(names) + 5, 30
+        sy, sx = (self.height - h) // 2, (self.width - w) // 2
+        cy, cx = self.height // 2, self.width // 2
+
+        for i in range(h):
+            self.stdscr.addstr(sy+i, sx, " " * w, curses.color_pair(0))
+        
+        self.stdscr.addstr(cy - 2, cx - 7, "SELECT ACCOUNT", curses.A_BOLD | curses.color_pair(16)) 
+        
+        for i, name in enumerate(names):
+            is_sel = (i == self.switcher_idx)
+            prefix = "  "
+            if is_sel:
+                if name != self.NEW_ACCOUNT_STR:
+                    vpath = self.engine._get_vault_path(name)
+                    prefix = "> "
+                else:
+                    vpath = self.engine._get_vault_path("*")
+                    prefix = "+ "
+                color = curses.color_pair(8) | curses.A_REVERSE
+            else:
+                color = curses.color_pair(25)
+            self.stdscr.addstr(cy+i, sx+6, f"{prefix}{name}", color)
+        self.stdscr.addstr(cy - 4, cx - 18, vpath[-36:], curses.color_pair(13))
+
+class ChatScreen(BaseScreen):
+    """
+    The Main Interface: Chat Log, Status Bar, Command Input.
+    """
+    def __init__(self, stdscr, engine):
+        super().__init__(stdscr, engine)
+        self.logs = [] # Now stores RichLine objects
+        self.chat_scrl_off = 0
+        self.menu_scrl_off = 0
+        self.input_box = TextInput(prompt=">> ", draw_cursor=True)
+        self.show_list_overlay = False
+        self.print_banner()
+
+    
+    # Chat log commands
+    def refresh_view(self, history: list):
+        """
+        Hard reset of the local log buffer using a provided list of 
+        formatted history dictionaries from the Engine.
+        """
+        self.logs = []
+        self.chat_scrl_off = 0
+        
+        for msg in history:
+            self.push_chat_message(
+                sender_nick=msg['nick'],
+                text=msg['text'],
+                timestamp=msg['time'],
+                sender_color=msg['sender_color'],
+                text_color=msg['text_color']
+            )
+
+    def push_chat_message(self, sender_nick, text, timestamp, sender_color=16, text_color=0):
+        """
+        Formats and adds a persistent chat message to the buffer.
+        """
+        line = RichLine(is_chat=True)
+        line.add(25, f"[{timestamp}] ")
+        line.add(sender_color, f"{sender_nick}: ")
+        line.add(text_color, text)
+        self.logs.append(line)
+
+    def push_system_log(self, text, color_id=25):
+        """
+        Adds a non-persistent system notification or ASCII art to the buffer.
+        Marked with is_chat=False so it can be cleared.
+        """
+        line = RichLine(is_chat=False)
+        line.add(color_id, text)
+        self.logs.append(line)
+
+    def clear_non_chat(self):
+        """
+        Clears all non chat from active chat log
+        """
+        # Filter the list based on the is_chat flag in rich line
+        self.logs = [line for line in self.logs if line.is_chat]
+        self.chat_scrl_off = 0
+    # Drawing
+    def draw(self):
+        self.stdscr.clear()
+        info = self.engine.get_status_bar_info()
+        # STATUS BAR
+        self.draw_status_bar(info)
+        # CHAT LOG (Middle)
+        # slice logs
+        chat_height = self.height - 3
+        if self.chat_scrl_off > 0:
+            start_idx = -(chat_height + self.chat_scrl_off)
+            end_idx = -self.chat_scrl_off
+            visible_logs = self.logs[max(0, len(self.logs) + start_idx) : end_idx]
+        else:
+            visible_logs = self.logs[-chat_height:]
+        # draw visible logs
+        for y_offset, rich_line in enumerate(visible_logs):
+            y_pos = 1 + y_offset
+            if y_pos >= self.height - 1: break
+            current_x = 0
+            for color_id, text in rich_line.segments:
+                if current_x >= self.width - 1: break
+                try:
+                    # Draw each segment and update the X cursor
+                    self.stdscr.addstr(y_pos, current_x, text[:self.width-1-current_x], curses.color_pair(color_id))
+                    current_x += len(text)
+                except curses.error:
+                    pass
+        # TAB OVERLAY (Draw on top if active)
+        if self.show_list_overlay:
+            self._draw_overlay(info)
+        
+        # Draw PS1
+        if info['server'] == "NONE":
+            conn_col = 8
+        else:
+            conn_col = 15
+        text = self.input_box.get_text()
+        bash_col = self.bash_to_col(text)
+        self.input_box.prompt = f"{info['nick']}@freq # "
+        self.input_box.draw(self.stdscr, self.height - 2, 0, self.width, ps1_colors=[13,conn_col,4,bash_col])
+
+    def bash_to_col(self, text):
+        #command dictionary
+        valid_cmds = [
+            "/friend","/join","/leave","/nick","/del","/file","/ft","/connect",
+            "/c","/disconnect","/clean","/server","/s","/n","/exit","/policy","/dc"
+        ]
+        if not text.startswith("/"):
+            return 13
+        parts = text.split(" ", 1)
+        cmd = parts[0]
+        if cmd in valid_cmds:
+            return 12
+        return 10
+
+    def draw_status_bar(self, info):
+        try:
+            ver_text = f" FR3Q (v{info['ver']}) "
+            room_text = f" {info['room']}"
+            server_text = f"{info['server']} "
+            num_peers = len(info['peers']) - 1 if info['peers'] else 0
+            peers_text = f"({num_peers})"
+            
+            status_box = f"  {info['status']}   "
+            
+            # resolve color
+            if info['tor']:
+                status_color = curses.color_pair(23) if info['server'] != "NONE" else curses.color_pair(7) | curses.A_REVERSE
+            else:
+                status_color = curses.color_pair(25) | curses.A_REVERSE
+                
+            base_color = curses.color_pair(25) | curses.A_REVERSE
+            active_status_color = status_color | curses.A_BOLD
+
+            center_x = self.width // 2
+            
+            # bg
+            self.stdscr.addstr(0, 0, " " * self.width, base_color)
+
+            self.stdscr.addstr(0, 0, ver_text, base_color)
+
+            # place
+            self.stdscr.addstr(0, center_x, "@", base_color)
+            self.stdscr.addstr(0, center_x - len(room_text), room_text, base_color)
+            self.stdscr.addstr(0, center_x + 1, server_text, base_color)
+
+            # peers
+            self.stdscr.addstr(0, center_x + 1 + len(server_text), peers_text, base_color)
+
+            # status bar
+            start_x_status = self.width - len(status_box)
+            if start_x_status > 0:
+                self.stdscr.addstr(0, start_x_status-1, "|", base_color)
+                self.stdscr.addstr(0, start_x_status, status_box, active_status_color)
+                self.stdscr.addstr(0, self.width-1, "|", base_color)
+
+        except curses.error:
+            pass
+
+    def _draw_overlay(self, info):
+        """Helper to draw the Server/Alias list popup with scrolling"""
+        # Dimensions
+        h, w = self.height - 4, self.width - 8
+        sy, sx = 2, 4
+        max_view_rows = h - 4 
+        
+        try:
+            # Box
+            for i in range(h):
+                # Background frame
+                self.stdscr.addstr(sy+i, sx, " " * w, curses.color_pair(8) | curses.A_REVERSE)
+                if i not in (0, h - 1):
+                    # content area
+                    self.stdscr.addstr(sy+i, sx+1, " " * (w - 2), curses.color_pair(27))
+            
+            servers_dict = self.engine.profile_cache.get('servers', {})
+            aliases_dict = self.engine.profile_cache.get('aliases', {})
+            links = self.engine.profile_cache.get('server_links', {})
+            total_items = max(len(servers_dict), len(aliases_dict))
+            can_go_up = self.menu_scrl_off > 0
+            can_go_down = total_items > (self.menu_scrl_off + max_view_rows)
+
+            # Current status info
+            current_server = info['server']
+            current_room = info['room']
+            server_link_list = links.get(current_server, []) # List of aliases linked to active server
+
+            # Slicing the lists based on scroll offset
+            server_items = list(servers_dict.items())[self.menu_scrl_off : self.menu_scrl_off + max_view_rows]
+            alias_items = list(aliases_dict.keys())[self.menu_scrl_off : self.menu_scrl_off + max_view_rows]
+
+            # Headers
+            self.stdscr.addstr(sy+1, sx+2, " SERVERS ", curses.A_BOLD)
+            mid_x = sx + w//2
+            self.stdscr.addstr(sy+1, mid_x+2, " ALIASES ", curses.A_BOLD)
+
+            # Servers
+            for i, (name, url) in enumerate(server_items):
+                is_active = (name == current_server)
+                if is_active:
+                    color = curses.color_pair(14)
+                    prefix = "@ "
+                else:
+                    color = curses.color_pair(8)
+                    prefix = "  "
+                
+                txt = f"{prefix}{name}"
+                # Truncate to avoid overlapping columns
+                self.stdscr.addstr(sy+3+i, sx+2, txt[:(w//2)-4], color)
+
+            # Aliases
+            for i, name in enumerate(alias_items):
+                is_dm = (name == current_room)
+                is_linked = name in server_link_list
+                
+                if is_dm:
+                    prefix = " > "
+                    color = curses.color_pair(7)
+                elif is_linked:
+                    prefix = " - "
+                    color = curses.color_pair(12)
+                else:
+                    prefix = "   "
+                    color = curses.color_pair(8)
+
+                txt = f"{prefix}{name}"
+                # Truncate to avoid bleeding off the right edge
+                self.stdscr.addstr(sy+3+i, mid_x+2, txt[:(w//2)-4], color)
+
+            # Scroll indicator
+            if can_go_up:
+                self.stdscr.addstr(sy, mid_x - 2, " ^^^ ", curses.color_pair(8) | curses.A_REVERSE)
+            if can_go_down:
+                self.stdscr.addstr(sy + h - 1, mid_x - 2, " vvv ", curses.color_pair(8) | curses.A_REVERSE)
+
+        except curses.error:
+            pass
+
+    def print_banner(self):
+        chunks = [
+            r"  ______   ______    ","        ",r"   ______        ",
+            r" /_____/\ /_____/\  ","  ______ ",r"  /_____/\       ",
+            r" \::::_\/_\:::_ \ \  ","/_____/\\ ",r" \:::_ \ \      ",
+            r"  \:\/___/\\:(_) ) )_","\:::_:\ \\ ",r" \:\ \ \ \_    ",
+            r"   \:::._\/ \: __ `\ \ "," /_\:\ \\ ",r" \:\ \ /_ \   ",
+            "    \:\ \    \ \ `\ \ \\"," \::_:\ \\ ",r" \:\_-  \ \  ",
+            r"     \_\/     \_\/ \_\/",r" /___\:\ ' ",r" \___|\_\_/ ",
+            r"                        ",r"\______/",r"             "
+        ]
+        
+        for i in range(8):
+            row_line = RichLine()
+            for j in range(3):
+                text_segment = chunks[(i * 3) + j]
+                color = 12 if j == 1 else 0
+                row_line.add(color, text_segment)
+            self.logs.append(row_line)
+    # Input
+    def handle_input(self, key):
+        # 1. Check for Overlays/Screens first
+        if key == 9: # Tab
+            self.show_list_overlay = not self.show_list_overlay
+            return
+        if key == 27: # ESC
+            return ConfigScreen(self.stdscr, self.engine)
+        #Scrolling
+        if key == curses.KEY_UP:
+            if self.show_list_overlay:
+                #overlay scroll
+                if self.menu_scrl_off > 0:
+                    self.menu_scrl_off -= 1
+            else:
+            #chat scroll
+                if self.chat_scrl_off < len(self.logs) - (self.height - 3):
+                    self.chat_scrl_off += 1
+        elif key == curses.KEY_DOWN:
+            if self.show_list_overlay:
+                num_servers = len(self.engine.profile_cache.get('servers', {}))
+                num_aliases = len(self.engine.profile_cache.get('aliases', {}))
+                max_items = max(num_servers, num_aliases)
+                #overlay scroll
+                if self.menu_scrl_off < max_items - (self.height - 8):
+                    self.menu_scrl_off += 1
+            else:
+                #chat scroll
+                if self.chat_scrl_off > 0:
+                    self.chat_scrl_off -= 1
+
+        result = self.input_box.handle_key(key)
+        if isinstance(result, str):
+            # The user pressed Enter! result is the command string.
+            if result:
+                self.engine.handle_input(result)
+                self.chat_scrl_off = 0
+                self.input_box.reset()
+        
+class ConfigScreen(BaseScreen):
+    """
+    Dashboard view for Profile fields and System Info.
+    """
+    def draw(self):
+        curses.curs_set(0)
+        self.stdscr.clear()
+        
+        header = f" CLIENT "
+        self.stdscr.addstr(0, 0, f"{header:<{self.width}}", curses.A_REVERSE | curses.A_BOLD)
+
+        # Fetch Data
+        my_id = self.engine.vault.get_my_identity_hex() if self.engine.vault else "LOCKED"
+        profile = self.engine.profile_cache
+        info = self.engine.get_status_bar_info()
+        ver = getattr(self.engine, 'ptver', '!!!')
+        if info['tor']:
+            if info['server'] != "NONE":
+                #Connected
+                proxy_status_color = curses.color_pair(15)
+                proxy_status = "Connected"
+            else: 
+                #Avaliable
+                proxy_status_color =curses.color_pair(7)
+                proxy_status = "Avaliable"
+        else:
+            #Disconnected/Unavaliable
+            proxy_status_color = curses.color_pair(0)
+            proxy_status = "Unavaliable"
+        ddir = profile.get('download_dir',"")
+        if ddir == "":
+            ddir = os.path.join(self.engine.get_home_dir(), "Downloads")
+        self.stdscr.addstr(1, 2, "PROFILE:", curses.A_BOLD)
+        self.stdscr.addstr(2, 3, "  IDENT:", curses.color_pair(25))
+        self.stdscr.addstr(2, 12, str(my_id), curses.color_pair(13))
+        self.stdscr.addstr(3, 3, "   NICK:", curses.color_pair(25))
+        self.stdscr.addstr(3, 12, profile.get('nickname', 'Anon'), curses.color_pair(13))
+        self.stdscr.addstr(4, 3, "ALIASES:", curses.color_pair(25))
+        self.stdscr.addstr(4, 12, str(len(profile.get('aliases', {}))), curses.color_pair(0))
+        self.stdscr.addstr(5, 3, "SERVERS: ", curses.color_pair(25))
+        self.stdscr.addstr(5, 12, str(len(profile.get('servers', {}))), curses.color_pair(0))
+
+        self.stdscr.addstr(6, 2, "NETWORK:", curses.A_BOLD)
+        self.stdscr.addstr(7, 3, " STATUS:", curses.color_pair(25))
+        self.stdscr.addstr(7, 12, proxy_status, proxy_status_color)
+        self.stdscr.addstr(8, 3, "  PROXY:", curses.color_pair(25))
+        self.stdscr.addstr(8, 12, profile.get('tor_proxy', 'Unknown'), curses.color_pair(15))
+        self.stdscr.addstr(9, 3, "  PEERS:", curses.color_pair(25))
+        self.stdscr.addstr(9, 12, str(len(info['peers'])), curses.color_pair(0))
+
+        self.stdscr.addstr(10, 2, " POLICY:", curses.A_BOLD)
+        #msg policy
+        #file policy
+        self.stdscr.addstr(13, 3, "     DL:", curses.color_pair(25))
+        self.stdscr.addstr(13, 12, ddir, curses.color_pair(0))
+
+        self.stdscr.addstr(14, 2, "  VAULT:", curses.A_BOLD)
+        self.stdscr.addstr(15, 3, "   PATH:", curses.color_pair(25))
+        self.stdscr.addstr(15, 12, self.engine._get_vault_path(), curses.color_pair(0))
+
+
+
+        version = f"VERSION: {ver}"
+        self.stdscr.addstr(self.height - 1, self.width - (len(version) + 1), version, curses.A_BOLD)
+
+    def handle_input(self, key):
+        if key == 27: # ESC
+            #saves state rather than returning new instance
+            return "BACK"
