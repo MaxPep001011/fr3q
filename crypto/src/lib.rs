@@ -269,8 +269,8 @@ impl PyVault {
         let v = self._get_inner_mut()?;
         
         match type_key.as_str() {
-            "messages" => v.profile.msg_policy.mode = mode,
-            "files" => v.profile.file_policy.mode = mode,
+            "message" => v.profile.msg_policy.mode = mode,
+            "file" => v.profile.file_policy.mode = mode,
             _ => return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("Invalid policy type")),
         }
         v.save(&path, &pwd).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))
@@ -281,16 +281,31 @@ impl PyVault {
         let v = self._get_inner_mut()?;
         
         let policy = match type_key.as_str() {
-            "messages" => &mut v.profile.msg_policy,
-            "files" => &mut v.profile.file_policy,
+            "message" => &mut v.profile.msg_policy,
+            "file" => &mut v.profile.file_policy,
             _ => return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("Invalid policy type")),
         };
 
         match list_type.as_str() {
-            "whitelist" => { policy.whitelist.insert(key_hex); },
-            "blacklist" => { policy.blacklist.insert(key_hex); },
+            "whitelist" => { 
+                policy.blacklist.remove(&key_hex); 
+                policy.whitelist.insert(key_hex); 
+            },
+            "blacklist" => {
+                policy.whitelist.remove(&key_hex); 
+                policy.blacklist.insert(key_hex); 
+            },
             _ => return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("Invalid list type")),
         }
+        
+        v.save(&path, &pwd).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))
+    }
+
+    fn set_max_msg_size(&mut self, size: u64) -> PyResult<()> {
+        let path = self.file_path.clone();
+        let pwd = self.password.clone();
+        let v = self._get_inner_mut()?;
+        v.profile.max_msg_size = size;
         v.save(&path, &pwd).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))
     }
 
@@ -416,7 +431,7 @@ impl PyVault {
 
         Ok(changed)
     }
-    #[pyo3(signature = (recipients, input, timestamp))] // Add timestamp here
+    #[pyo3(signature = (recipients, input, timestamp))]
     fn send_multicast(
         &mut self, 
         py: Python, 

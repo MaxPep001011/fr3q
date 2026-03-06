@@ -1,7 +1,7 @@
 # ===================================================================================================================
 # ===================================================  Version  =====================================================
 # ===================================================================================================================
-ptversion = "0.0.6"
+ptversion = "0.1.02"
 
 MAX_INBOX_SIZE = 10*1024*1024 #10MB storage (queue + prekey storage)
 
@@ -121,6 +121,8 @@ def client_handler(conn, addr, clients):
         my_ident_hex = sender_bytes.hex()
         if my_ident_hex:
             clients[my_ident_hex] = conn
+            # Send updated client list
+            send_client_list(clients)
             # Save prekeys
             if msg_type == 0x00 and not d_data == b"NONE":
                 storage.save_bundle(my_ident_hex, d_data)
@@ -133,8 +135,7 @@ def client_handler(conn, addr, clients):
                 conn.sendall(m)
             if offline_msgs:
                 print(f"{s_timestamp()}[+] Delivered {len(offline_msgs)} offline messages to {my_ident_hex[:8]}..")
-            # Send updated client list
-            send_client_list(clients)
+            
             # Routing loop
             while my_ident_hex:
                 head_raw = recv_exact(conn, HEADER_SIZE)

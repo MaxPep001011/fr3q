@@ -103,8 +103,10 @@ class NetworkManager:
             except Exception:
                 pass
             self.socket = None
-        
+        self.engine.peers = []
+        self.engine.network = None
         logging.info("Network stopped")
+
 
     def send(self, data: bytes):
         """Adds raw bytes to outgoing queue for the sender thread."""

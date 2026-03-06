@@ -9,11 +9,13 @@ import struct
 import logging
 import hashlib
 import crypto
+import re
 from core.network import NetworkManager
 
 # Wire Protocol Constants (SAME AS SERVER)
 HEADER_FMT = ">B32s32sQII" # Type, Recip, Sender, HeadLen, DataLen
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
+CHAT_LOG_LENGTH = 50 #how many log entries to display upon refresh
 
 class Engine:
     """
@@ -26,7 +28,7 @@ class Engine:
         self.ptver = Version
         self.sys_config = sys_config
         self.vault = None
-        self.network = None 
+        self.network = None
         self.running = True
         
         self.status_msg = "BOOTING"
@@ -34,7 +36,8 @@ class Engine:
         self.peers = []
         self.current_server_name: str = None # Name of server, None = not in a server
         self.current_room_key: str = None # None = lobby, Hex String = dm with alias
-        self.pending_hs = {} # 
+        self.pending_hs = {}
+        self.notifications = {}
         # Events for UI to handle
         self.ui_queue = queue.Queue()
         # State Cache (Read from Vault) JSON
@@ -50,8 +53,8 @@ class Engine:
             "server_links": {
                 "NAME": [""]
             },
-            "msg_policy": "",
-            "file_policy": "",
+            "msg_policy": {},
+            "file_policy": {},
             "max_msg_size": 1000000,
             "download_dir": "",
             "tor_proxy": ""
@@ -66,7 +69,6 @@ class Engine:
         if self.vault_exists(name):
             self.acc_name = name
             if defaultAcc:
-                #Write vault path to global config
                 self.sys_config["default_acc"] = name
                 self.write_sys_config()
 
@@ -270,15 +272,97 @@ class Engine:
     def get_home_dir(self) -> str:
         return os.path.expanduser("~")
 
-    def policy_edit(self, ptype: str, policy: str, ident: str):
-        if ptype in ("m", "msg"):
-            #Message lists
-            if policy in ("a","allow"):
-                #Add to 
-                return
+    def policy_edit(self, ptype: str, policy: str, ident: str = None):
+        type_key = "message" if ptype in ("m", "msg") else "file"
+        if ident:
+            if policy in ("a", "allow"):
+                list_to_add = "whitelist"
+                ppolicy = "ALLOW"
+            else:
+                list_to_add = "blacklist"
+                ppolicy = "DENY"
+            self.vault.add_to_policy_list(type_key, list_to_add, ident)
+            pident = f"{ident[:8]}.." if len(ident) > 8 else ident
+            self.ui_queue.put({"print": f"[+] Added rule: {ppolicy} {type_key.upper()} from {pident}"})
         else:
-            #File lists
-            return
+            if policy in ("a", "allow"):
+                mode = "allow"
+            elif policy in ("d", "deny"):
+                mode = "deny"
+            else:
+                mode = "whitelist"
+            self.vault.set_policy_mode(type_key, mode)
+            self.ui_queue.put({"print": f"[+] Changed {type_key.upper()} policy to {mode.upper()}"})
+        self.refresh_profile()
+        
+    def rule_query(self, mtype, sender: str):
+        if mtype in (0x03, 0x04):
+            return True
+        elif mtype in (0x01, 0x11):
+            #msg
+            policy_type = "msg_policy"
+        elif mtype in (0x02, 0x12):
+            #file
+            policy_type = "file_policy"
+        else:
+            return False
+        target_policy = self.profile_cache.get(policy_type, {})
+        grule = target_policy.get("mode", "deny")
+        if grule == "allow":
+            #check blacklist
+            blist = target_policy.get("blacklist", [])
+            return sender not in blist
+        elif grule == "whitelist":
+            #check whitelist
+            wlist = target_policy.get("whitelist", [])
+            return sender in wlist
+        else:
+            return False
+
+    def set_max_msg_size(self, sizestr: str):
+        size = None
+        try:
+            match = re.match(r"^(\d+)\s*(b|kb|mb|gb)?$", sizestr.strip().lower())
+            
+            if match:
+                val = int(match.group(1))
+                unit = match.group(2)
+                
+                if unit == "kb":
+                    size = val * 1024
+                elif unit == "mb":
+                    size = val * 1024 * 1024
+                elif unit == "gb":
+                    size = val * 1024 * 1024 * 1024
+                else:
+                    size = val
+            
+            if size:
+                #set size
+                self.vault.set_max_msg_size(size)
+                self.refresh_profile()
+                self.ui_queue.put({"print": f"[+] Max message size set to {sizestr}"})
+            else:
+                self.ui_queue.put({"print": "[i] Usage: /policy limit <size>[b|kb|mb|gb]"})
+        except Exception as e:
+            self.ui_queue.put({"print": "[i] Usage: /policy limit <size>[b|kb|mb|gb]"})
+            logging.debug(f"Invalid size '{sizestr}': {e}")
+
+
+    def clear_notis(self):
+        """ clears the current rooms notifications """
+        if self.current_room_key is None:
+            #global chat?
+            if self.current_server_name is not None:
+                #global reset notifications
+                self.notifications[self.current_server_name] = 0
+            #not in server
+        else:
+            #dm reset notifications
+            alias = self.vault.get_contact_name(self.current_room_key)
+            if alias is not None:
+                self.notifications[alias] = 0
+            #could not find alias
 
     #### VAULT CONFIGS
     # Update CONFIGS
@@ -330,41 +414,55 @@ class Engine:
     def handle_input(self, text: str):
         """Entry point for Chat Screen input."""
         if not text: return
-        
+        self.clear_notis()
         if text.startswith('/'):
             self._parse_command(text)
         else:
             self.send_chat_msg(text)
     def _parse_command(self, cmd_str: str):
+        #interacted with current room so clear notifications
+        
         parts = cmd_str.strip().split(' ')
         cmd = parts[0].lower()
         args = parts[1:]
         #TODO:
-        # /default (acc)
         # /dir <type> <path>
-        # /proxy <ip:port>
-        # /disconnect /dc
+        # /log
         try:
             if cmd == "/friend":
                 if len(args) >= 2:
                     alias = args[0]
                     hex_key = args[1].lower()
                     if self.is_hex_key(hex_key):
-                        if not self.me(hex_key):
-                            self.friend_hs(alias, hex_key)
+                        if not self.me(hex_key) and alias != self.profile_cache.get('nickname'):
+                            if self.vault.get_server_url(alias) is None:
+                                if self.vault.get_contact_pubhex(alias) is None:
+                                    if alias != "GLOBAL":
+                                        self.friend_hs(alias, hex_key)
+                                    else:
+                                        self.ui_queue.put({"print": "[-] 'GLOBAL' is a reserved room name"})
+                                else:
+                                    self.ui_queue.put({"print": f"[-] Alias '{alias}' already exists"})
+                            else:
+                                self.ui_queue.put({"print": f"[-] Server '{alias}' already exists"})
                         else:
-                            self.ui_queue.put({"print": f"[-] Cannot add yourself"})
+                            self.ui_queue.put({"print": f"[-] Cannot use your own ident"})
                     else:
                         self.ui_queue.put({"print": f"[-] Invalid hex key '{hex_key}'"})
                 else:
                     self.ui_queue.put({"print": "[i] Usage: /friend <name> <hex_key>"})
             elif cmd == "/join":
                 if args:
+                    if args[0] == "GLOBAL":
+                        self.current_room_key = None
+                        self.ui_queue.put("room_changed")
+                        self.refresh_logs(CHAT_LOG_LENGTH)
+                        return
                     hex_key = self.vault.get_contact_pubhex(args[0])
                     if hex_key is not None:
                         # Alias
                         self.current_room_key = hex_key.lower()
-                        self.refresh_logs(50)
+                        self.refresh_logs(CHAT_LOG_LENGTH)
                     else:
                         # Maybe key
                         key_bytes = self.is_hex_key(args[0].lower())
@@ -372,9 +470,9 @@ class Engine:
                             if self.vault.has_session(key_bytes):
                                 # Valid key
                                 self.current_room_key = args[0].lower()
-                                self.refresh_logs(50)
+                                self.refresh_logs(CHAT_LOG_LENGTH)
                             else:
-                                self.ui_queue.put({"print": f"[-] Could not find '{args[0]}'"})
+                                self.ui_queue.put({"print": f"[-] Could not find session for '{args[0]}'"})
                         else:
                             self.ui_queue.put({"print": f"[-] Invalid key '{args[0]}'"})
                 else:           
@@ -382,13 +480,27 @@ class Engine:
             elif cmd == "/leave":
                 self.current_room_key = None
                 self.ui_queue.put("room_changed")
-                self.refresh_logs(50)
+                self.refresh_logs(CHAT_LOG_LENGTH)
             elif cmd == "/nick":
                 if args:
-                    self.vault.set_nickname(args[0])
-                    self.refresh_profile()
+                    nick = args[0]
+                    if self.vault.get_server_url(nick) is None:
+                        if self.vault.get_contact_pubhex(nick) is None:
+                            self.vault.set_nickname(nick)
+                            self.refresh_profile()
+                        else:
+                            self.ui_queue.put({"print": f"[-] Alias '{nick}' already exists"})
+                    else:
+                        self.ui_queue.put({"print": f"[-] Server '{nick}' already exists"})
                 else:
                     self.ui_queue.put({"print": "[i] Usage: /nick <nickname>"})
+            elif cmd == "/default":
+                current_acc = self.profile_cache.get('nickname', False)
+                if current_acc:
+                    self.set_account(current_acc, True)
+                    self.ui_queue.put({"print": f"[+] Set default account to {current_acc}"})
+                else:
+                    self.ui_queue.put({"print": f"[-] Could not find account"})
             elif cmd == "/del":
                 if len(args) >= 1:
                     alias = args[0]
@@ -419,6 +531,7 @@ class Engine:
                     # Update
                     self.refresh_profile()
                     self.ui_queue.put({"print": f"[+] Purged all data for '{alias}'"})
+                    self.ui_queue.put({"print": f"[i] If you want to chat again, they will have to run /del as well"})
                 else:
                     self.ui_queue.put({"print": "[i] Usage: /del <alias>"})
             #SEND FILE/DIR        
@@ -449,13 +562,31 @@ class Engine:
                 if self.network:
                     self.status_msg = "DISCONNECTING"
                     self.network.stop()
+                    my_bytes = bytes.fromhex(self.vault.get_my_identity_hex())
+                    self.push_chat_ui(self.get_tid(), my_bytes, "Left", time.time(), False, False)
                     self.status_msg = "DISCONNECTED"
                 self.current_room_key = None
                 self.current_server_name = None
+                
             elif cmd == "/clean":
                 self.ui_queue.put({
                     "command": "clean_logs"
                 })
+            elif cmd in ("/refresh","/r"):
+                self.refresh_profile()
+                if self.current_server_name is not None:
+                    if args:
+                        try:
+                            history = int(args[0])
+                            self.refresh_logs(history)
+                        except Exception:
+                            self.ui_queue.put({"print": "[i] Usage: /refresh [<amount>]"})
+                    else:
+                        self.refresh_logs(CHAT_LOG_LENGTH)
+                else:
+                    self.ui_queue.put({
+                        "command": "clean_logs"
+                    })
             elif cmd in ("/server", "/s"):
                 if len(args) >= 1:
                     if args[0] in ("add", "a"):
@@ -464,13 +595,16 @@ class Engine:
                             #Rudementary check (chances are if they typed : they typed a port)
                             if ":" in url:
                                 if self.vault.get_server_url(name) is None:
-                                    self.vault.set_server(name, url)
-                                    self.refresh_profile()
-                                    self.ui_queue.put({"print": f"[+] Added '{name}@{url[:5]}..{url[5:]}'"})
+                                    if self.vault.get_contact_pubhex(name) is None:
+                                        self.vault.set_server(name, url)
+                                        self.refresh_profile()
+                                        self.ui_queue.put({"print": f"[+] Added '{name}@{url[:5]}..{url[5:]}'"})
+                                    else:
+                                        self.ui_queue.put({"print": f"[-] Alias '{name}' already exists"})
                                 else:
                                     self.ui_queue.put({"print": f"[-] Server '{name}' already exists"})
                             else:
-                                self.ui_queue.put({"print": "[-] URL missing port"})
+                                self.ui_queue.put({"print": "[-] URL missing :port"})
                         else:
                             self.ui_queue.put({"print": "[i] Usage: /server add <name> <url:port>"})
                     elif args[0] in ("del", "remove","d","r"):
@@ -485,35 +619,59 @@ class Engine:
                 else:
                     self.ui_queue.put({"print": "[i] Usage: /server add|del <name> [<url:port>]"})
             
-            elif cmd == "/policy":
-                if len(args) >= 3:
-                    if args[0] in ("msg","file") and args[1] in ("allow","a","d","deny"):
-                        hex_key = self.vault.get_contact_pubhex(args[2])
-                        ident = False
-                        if hex_key is not None:
-                            #Alias
-                            ident = hex_key
-                        elif self.is_hex_key(args[2]):
-                            #Hex key
-                            ident = args[2]
-                        if ident:
-                            self.policy_edit(args[0], args[1], ident)
-                        else:
-                            self.ui_queue.put({"print": f"[-] Could not resolve {args[2]}"})
+            elif cmd == "/proxy":
+                if args:
+                    if args[0] in ("def","default"):
+                        self.vault.set_tor_proxy("127.0.0.1:9050")
+                        self.refresh_profile()
+                        self.ui_queue.put({"print": f"[+] Using default proxy at {args[0]}"})
+                    elif ":" in args[0]:
+                        ip, port = args[0].split(":")
+                        try:
+                            nothing = int(port)
+                            self.vault.set_tor_proxy(args[0])
+                            self.refresh_profile()
+                            self.ui_queue.put({"print": f"[+] Using proxy at {args[0]}"})
+                        except Exception:
+                            self.ui_queue.put({"print": f"[-] Invalid port '{port}'"})
                     else:
-                        self.ui_queue.put({"print": "[i] Usage: /policy msg|file allow|deny <ident>"})
+                        self.ui_queue.put({"print": "[-] Proxy missing :port"})
                 else:
-                    self.ui_queue.put({"print": "[i] Usage: /policy msg|file allow|deny <ident>"})
-
-            elif cmd == "/log":
-                #will switch to log viewing screen (secure system logs)
-
-                self.ui_queue.put({"print": "**log**"})
-
+                    self.ui_queue.put({"print": "[i] Usage: /proxy <ip:port>"})
+            elif cmd == "/policy":
+                if len(args) >= 2:
+                    if args[0] in ("msg","m","f","file"):
+                        if len(args) >= 3:
+                            if args[1] in ("allow","a","d","deny"):
+                                hex_key = self.vault.get_contact_pubhex(args[2])
+                                ident = False
+                                if hex_key is not None:
+                                    #Alias
+                                    ident = hex_key
+                                elif self.is_hex_key(args[2]):
+                                    #Hex key
+                                    ident = args[2]
+                                if ident:
+                                    self.policy_edit(args[0], args[1], ident)
+                                else:
+                                    self.ui_queue.put({"print": f"[-] Could not resolve {args[2]}"})
+                            else:
+                                self.ui_queue.put({"print": f"[i] Usage: /policy {args[0]} allow|deny <ident>"})
+                        elif args[1] in ("allow","a","d","deny","w","whitelist"):
+                            self.policy_edit(args[0], args[1])
+                        else:
+                            self.ui_queue.put({"print": f"[i] Usage: /policy {args[0]} allow|deny|whitelist"})
+                    elif args[0] in ("size","limit","l","s"):
+                        self.set_max_msg_size(args[1])
+                    else:
+                        self.ui_queue.put({"print": "[i] Usage: /policy msg|file|limit <policy> [<ident>]"})
+                else:
+                    self.ui_queue.put({"print": "[i] Usage: /policy msg|file|limit <policy> [<ident>]"})
+            
             elif cmd == "/n":
-                #prints newline char
-                self.ui_queue.put({"print": ""})
-            elif cmd == "/exit":
+                #prints empty line
+                self.ui_queue.put({"print": " "})
+            elif cmd in ("/exit", "/quit", "/q"):
                 self.shutdown()
             elif cmd[0] == '/':
                 #StartsWith
@@ -525,6 +683,7 @@ class Engine:
 
         except Exception as e:
             self.vault.log("ERROR", f"Command failed: {e}")
+            logging.debug(f"parse_command failed: {e}")
 
     ##### OUTBOUND
 
@@ -580,12 +739,12 @@ class Engine:
                 logging.error(f"multicast error:{e}")
             
             mtype = 0x01 if self.current_room_key is None else 0x11
-            logging.debug(f"DBGG: len of pckts to multicast is {str(len(packets))}, {str(mtype)}")
             self._dispatch_packets(packets, mtype, ts)
 
             # Log and show
             my_id_bytes = bytes.fromhex(self.vault.get_my_identity_hex())
             self.vault.add_chat_log(self.get_tid(), my_id_bytes, ts, plaintext)
+            
             self.push_chat_ui(self.get_tid(), my_id_bytes, plaintext, ts)
     #0x02 (FILE)
     def send_file(self, filepath: str):
@@ -730,25 +889,34 @@ class Engine:
                 msg_type, recip, sender, ts, h_len, d_len = struct.unpack(
                     HEADER_FMT, self._packet_buffer[:HEADER_SIZE]
                 )
-                
                 total_len = HEADER_SIZE + h_len + d_len
-                #logging.debug(f"[PARSER] Type: {hex(msg_type)} | TS: {ts} | H_Len: {h_len} | D_Len: {d_len} | Total: {total_len} | Buffer: {len(self._packet_buffer)}")
-                if len(self._packet_buffer) < total_len:
-                    break # Wait for more data
+                #Check policy rules:
+                sender_hex = sender.hex()
+                if self.rule_query(msg_type, sender_hex) and d_len <= self.profile_cache.get("max_msg_size", 1000000):
+                    if len(self._packet_buffer) < total_len:
+                        break # Wait for more data
+                        
+                    packet_data = self._packet_buffer[:total_len]
+                    self._packet_buffer = self._packet_buffer[total_len:]
                     
-                packet_data = self._packet_buffer[:total_len]
-                self._packet_buffer = self._packet_buffer[total_len:]
-                
-                header = packet_data[HEADER_SIZE : HEADER_SIZE + h_len]
-                data = packet_data[HEADER_SIZE + h_len :]
-                
-                # Pass the TS into the next stage
-                self.handle_net_buffer(msg_type, sender, header, data, ts)
+                    header = packet_data[HEADER_SIZE : HEADER_SIZE + h_len]
+                    data = packet_data[HEADER_SIZE + h_len :]
+                    
+                    # Pass the TS into the next stage
+                    self.handle_net_buffer(msg_type, sender, header, data, ts)
+                else:
+                    vault.log("WARN", f"type {msg_type} from {sender.hex} blocked by policy")
+                    logging.debug(f"type {msg_type} from {sender.hex} blocked by policy")
+                    if len(self._packet_buffer) < total_len:
+                        break # Wait for more data
+                    self._packet_buffer = self._packet_buffer[total_len:]
             except Exception as e:
-                logging.error(f"Critical packet error: {e}")
+                logging.debug(f"Critical packet error while processing buffer: {e}")
+                logging.error(f"Critical packet error while processing buffer")
                 self._packet_buffer = b""
                 break
     def handle_net_buffer(self, msg_type, sender, header, data, ts):
+        logging.debug(f"Recieved msg type:{msg_type}")
         sender_hex = sender.hex()
         if msg_type == 0x03:   # Peers
             self.handle_list(data)
@@ -765,7 +933,6 @@ class Engine:
         else:
             self.vault.log("WARN", f"Unknown msg_type {msg_type} from {sender_hex[:8]}")
             logging.debug(f"Unknown msg_type {msg_type} from {sender_hex[:8]}")
-        logging.debug(f"Recieved msg type:{msg_type}")
     #0x01 (MSG)
     def handle_chat_msg(self, sender, header, data, ts, is_dm):
         sender_hex = sender.hex().lower()
@@ -775,7 +942,7 @@ class Engine:
             self.vault.log("INFO", f"Recieved chat request from {sender_hex[:8]}..")
             logging.debug(f"Recieved chat request from {sender_hex[:8]}..")
             self.ui_queue.put({"print": f"[+] Chat Request from {sender_hex[:8]}.."})
-            self.ui_queue.put({"print": f"[i] Type '/friend <name> {sender_hex}' to accept"})
+            self.ui_queue.put({"print": f"[i] /friend <name> {sender_hex} to accept"})
             return
         try:
             #Decrypt
@@ -831,12 +998,36 @@ class Engine:
     def handle_list(self, jsonList):
         try:
             self.refresh_profile()
+            old_set = set(self.peers) if self.peers else set()
             new_list = json.loads(jsonList.decode("utf-8"))
+            new_set = set(new_list)
+            links = self.profile_cache.get('server_links',{}).get(self.current_server_name, [])
+            joined = new_set - old_set
+            left = old_set - new_set
+            
+            current_ts = time.time()
+            
+            # left
+            for ident in left:
+                #local leave messages are handled by disconnect command for now
+                if self.me(ident): continue
+                self.push_chat_ui(self.get_tid(), bytes.fromhex(ident), "Left", time.time(), False, False)
+
+            # joined
+            for ident in joined:
+                if ident not in links:
+                    self.vault.link_to_server(bytes.fromhex(ident), self.current_server_name)
+                    self.refresh_profile()
+                    logging.debug(f"Linked '{ident[:8]}..' to {self.current_server_name}")
+                self.push_chat_ui(self.get_tid(), bytes.fromhex(ident), "Joined", time.time(), False, False)
+
             self.peers = new_list
+            logging.debug(f"client list update:{str(new_list)}")
             self.status_msg = "CONNECTED"
             self.ui_queue.put("peer_list_update")
+            
         except Exception as e:
-                logging.error(f"type 0x03 parse failed: {e}")
+            logging.error(f"type 0x03 parse failed: {e}")
     #0x04 (PREKEYS)
     def handle_bundle_resp(self, target_bytes, bundle_json):
         try:
@@ -869,7 +1060,7 @@ class Engine:
 
     ##### UI
     # LIVE
-    def push_chat_ui(self, tid: bytes, sender: bytes, text: str, ts: int, is_file=False):
+    def push_chat_ui(self, tid: bytes, sender: bytes, text: str, ts: int, is_file=False, colon=True):
         sender_hex = sender.hex().lower()
         
         # get tid
@@ -877,18 +1068,35 @@ class Engine:
         if tid == current_view_tid:
             raw_msg = [(ts, text, "file" if is_file else None, sender)]
             
-            formatted = self.format_logs(raw_msg)[0]
+            formatted = self.format_logs(raw_msg, colon)[0]
+            self.clear_notis()
             self.ui_queue.put({"chat": formatted})
-            logging.debug(f"Pushed msg to UI for TID: {tid.hex()[:8]}")
+            logging.debug(f"Pushed msg to UI for TID: {tid.hex()}")
         else:
-            # Background notification logic
+            # Background notification logic (TODO:fix so upon original joining of room, put unread bar at end by default)
             if not self.me(sender_hex):
                 alias = self.vault.get_contact_name(sender_hex) or sender_hex[:8]
-                self.ui_queue.put({"print": f"[*] New msg from {alias} (in another room)"})
-            logging.debug(f"Background msg for TID: {tid.hex()[:8]} (Current: {current_view_tid.hex()[:8]})")
+                if tid == self.get_tid(None, True):
+                    #global notification (room)
+                    if self.current_server_name in self.notifications:
+                        #increment (name, int)
+                        self.notifications[self.current_server_name] += 1
+                    else:
+                        #create mapping and set to 1
+                        self.notifications[self.current_server_name] = 1
+                else:
+                    #dm notification
+                    if alias in self.notifications:
+                        #increment (name, int)
+                        self.notifications[alias] += 1
+                    else:
+                        #create mapping and set to 1
+                        self.notifications[alias] = 1
+                self.ui_queue.put("notification")
+            logging.debug(f"Background msg for TID: {tid.hex()[:8]}.. (Current: {current_view_tid.hex()})")
     
     # MSG LOG
-    def format_logs(self, raw_logs):
+    def format_logs(self, raw_logs, colon=True):
         """Determines 'is_me' on the fly by comparing keys"""
         aliases = self.profile_cache.get("aliases", {})
         rev_aliases = {v.lower(): k for k, v in aliases.items()}
@@ -905,7 +1113,10 @@ class Engine:
                 s_color = 13 # Cyan
                 t_color = 8  # Light Grey
             else:
-                name = rev_aliases.get(sender_hex, f"[{sender_hex[:8]}]")
+                name = rev_aliases.get(sender_hex, False)
+                if not name:
+                    name = f"{sender_hex[:8]}.."
+                    s_color = 11 # Yellow
                 s_color = 12 # Green
                 t_color = 16 # White
 
@@ -914,7 +1125,8 @@ class Engine:
                 "nick": name,
                 "text": text,
                 "sender_color": s_color,
-                "text_color": 7 if fpath else t_color
+                "text_color": 7 if fpath else t_color,
+                "colon": False if fpath else colon
             })
         return formatted
     def get_msg_history(self, limit: int = 50):
@@ -933,9 +1145,10 @@ class Engine:
         """
         history = self.get_msg_history(limit=limit)
         self.ui_queue.put({
-            "command": "refresh", 
+            "command": "refresh",
             "data": history
         })
+
     # VAULT LOGS
     def get_system_logs(self):
         if not self.vault: return []
@@ -963,5 +1176,6 @@ class Engine:
             "nick": nick,
             "ver": self.ptver,
             "tor": self.tor_status(),
-            "peers": self.peers
+            "peers": self.peers,
+            "notifications": self.notifications # (name(str): amount(int))
         }

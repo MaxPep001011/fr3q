@@ -145,7 +145,8 @@ class App:
                                     text=data.get('text', ''),
                                     timestamp=data.get('time', '--:--'),
                                     sender_color=data.get('sender_color', 11),
-                                    text_color=data.get('text_color', 0)
+                                    text_color=data.get('text_color', 0),
+                                    colon=data.get('colon', True)
                                 )
                         # COMMANDS
                         elif "command" in msg:

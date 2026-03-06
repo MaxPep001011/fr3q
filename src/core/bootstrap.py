@@ -18,11 +18,12 @@ def get_freq_dir():
 def setup_logging(debug_mode: bool):
     """
     Configures logging to file. 
-    CRITICAL: Curses uses stdout/stderr, so we must log to a file.
+    Must have valid log path
     """
     log_dir = os.path.join(get_freq_dir(), "logs")
     os.makedirs(log_dir, exist_ok=True)
-    
+
+    #TODO:allow specific dir for logging
     log_file = os.path.join(log_dir, "std.log")
     
     level = logging.DEBUG if debug_mode else logging.INFO
@@ -30,7 +31,8 @@ def setup_logging(debug_mode: bool):
     logging.basicConfig(
         filename=log_file,
         filemode="a",
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        #format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        format="%(asctime)s [%(levelname)s] %(message)s",
         level=level
     )
     

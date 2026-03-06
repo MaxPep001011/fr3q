@@ -6,7 +6,7 @@ __pycache__/
 .env
 venv/
 .venv/
-storage
+storage/
 .pytest_cache/
 **/*.rs.bk
 *.dat
@@ -14,5 +14,6 @@ storage
 *.log
 makefile
 makefile (p)
+INFO
 TODO
 crypto/target

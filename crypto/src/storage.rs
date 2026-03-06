@@ -14,8 +14,7 @@ use ed25519_dalek::{Signer};
 use crate::dratchet::{PreKeyBundle};
 
 // Constants
-//constant salt for now (useless) TODO: implement random salt
-const VAULT_SALT: &str = "FreqSecureSaltV123456789"; 
+const SALT_LEN: usize = 16;
 const MAX_HISTORY: usize = 500;
 const MAX_SYSTEM_LOGS: usize = 1000;
 
@@ -209,7 +208,7 @@ impl Vault {
             identity_dh_pub: self.identity.dh_public,
             signed_prekey_pub: spk_pub,
             signed_prekey_sig: signature,
-            one_time_prekeys: bundle_opks, // This is now your Vec<PublicKey>
+            one_time_prekeys: bundle_opks, // your Vec<PublicKey>
         }
     }
     //  LOGGING HELPERS 
@@ -251,7 +250,10 @@ impl Vault {
     
     pub fn save(&self, path: &str, password: &str) -> Result<(), String> {
         let plaintext = bincode::serialize(self).map_err(|e| e.to_string())?;
-        let key = derive_key(password);
+        
+        let mut salt_bytes = [0u8; SALT_LEN];
+        OsRng.fill_bytes(&mut salt_bytes);
+        let key = derive_key(password, &salt_bytes).map_err(|e| e.to_string())?;
         
         let mut nonce_bytes = [0u8; 12];
         OsRng.fill_bytes(&mut nonce_bytes);
@@ -262,6 +264,7 @@ impl Vault {
             .map_err(|e| e.to_string())?;
 
         let mut file = File::create(path).map_err(|e| e.to_string())?;
+        file.write_all(&salt_bytes).map_err(|e| e.to_string())?;
         file.write_all(&nonce_bytes).map_err(|e| e.to_string())?;
         file.write_all(&ciphertext).map_err(|e| e.to_string())?;
         
@@ -274,16 +277,21 @@ impl Vault {
         }
         let mut file = File::open(path).map_err(|e| e.to_string())?;
         
+        let mut salt_bytes = [0u8; SALT_LEN];
+        if file.read_exact(&mut salt_bytes).is_err() {
+            return Err("Vault file corrupted (missing salt)".to_string());
+        }
+        
         let mut nonce_bytes = [0u8; 12];
         if file.read_exact(&mut nonce_bytes).is_err() {
-            return Err("Vault file corrupted".to_string());
+            return Err("Vault file corrupted (missing nonce)".to_string());
         }
         let nonce = Nonce::from_slice(&nonce_bytes);
 
         let mut ciphertext = Vec::new();
         file.read_to_end(&mut ciphertext).map_err(|e| e.to_string())?;
 
-        let key = derive_key(password);
+        let key = derive_key(password, &salt_bytes).map_err(|e| e.to_string())?;
         let cipher = Aes256Gcm::new(&key);
         
         let plaintext = cipher.decrypt(nonce, ciphertext.as_ref())
@@ -295,13 +303,13 @@ impl Vault {
 }
 
 // Helpers
-fn derive_key(password: &str) -> Key<Aes256Gcm> {
-    let salt = SaltString::from_b64(VAULT_SALT).unwrap();
+fn derive_key(password: &str, salt_bytes: &[u8]) -> Result<Key<Aes256Gcm>, argon2::password_hash::Error> {
+    let salt = SaltString::encode_b64(salt_bytes)?;
     let argon2 = Argon2::default();
-    let output = argon2.hash_password(password.as_bytes(), &salt).unwrap().hash.unwrap();
+    let output = argon2.hash_password(password.as_bytes(), &salt)?.hash.unwrap();
     let mut key_bytes = [0u8; 32];
     key_bytes.copy_from_slice(&output.as_bytes()[0..32]); 
-    *Key::<Aes256Gcm>::from_slice(&key_bytes)
+    Ok(*Key::<Aes256Gcm>::from_slice(&key_bytes))
 }
 
 fn get_time() -> u64 {

@@ -2,6 +2,7 @@ import curses
 import time
 import re
 import os
+import logging
 from ui.input import TextInput, RichLine
 
 class BaseScreen:
@@ -104,8 +105,8 @@ class LockScreen(BaseScreen):
             #Check unique name and allowed chars
             if self.check_name(acc_name):
                 if self.is_setup:
-                    if self.engine.vault_exists(acc_name):
-                        self.msg = f"'{acc_name}' ALREADY TAKEN"
+                    if self.engine.vault_exists(acc_name) or acc_name == "GLOBAL":
+                        self.msg = f"'{acc_name}' ALREADY TAKEN/RESERVED"
                         self.focus_box = self.name_box
                         return
                     #Create account
@@ -145,7 +146,7 @@ class LockScreen(BaseScreen):
         title = "VAULT SETUP" if self.is_setup else "FR3Q VAULT"
         self.stdscr.addstr(cy - 6, cx - len(title)//2, title, curses.A_BOLD)
 
-        self.stdscr.addstr(cy - 2, cx - len(self.msg)//2, self.msg, curses.color_pair(2))
+        self.stdscr.addstr(cy - 2, cx - len(self.msg)//2, self.msg, curses.color_pair(2) | curses.A_DIM)
         vpath = self.engine._get_vault_path(self.name_box.get_text() or "*")
         if self.show_acc_switcher:
             #draw acc switcher
@@ -203,12 +204,22 @@ class ChatScreen(BaseScreen):
     """
     def __init__(self, stdscr, engine):
         super().__init__(stdscr, engine)
-        self.logs = [] # Now stores RichLine objects
+        self.logs = [] # RichLines
+        self.buffer = [] # visual lines
         self.chat_scrl_off = 0
         self.menu_scrl_off = 0
         self.input_box = TextInput(prompt=">> ", draw_cursor=True)
         self.show_list_overlay = False
         self.print_banner()
+        self._reflow_buffer()
+
+    def resize(self):
+        super().resize()
+        self._reflow_buffer()
+        # Clamp scroll offset
+        max_scroll = max(0, len(self.buffer) - (self.height - 2))
+        if self.chat_scrl_off > max_scroll:
+            self.chat_scrl_off = max_scroll
 
     
     # Chat log commands
@@ -218,8 +229,8 @@ class ChatScreen(BaseScreen):
         formatted history dictionaries from the Engine.
         """
         self.logs = []
+        self.buffer = []
         self.chat_scrl_off = 0
-        
         for msg in history:
             self.push_chat_message(
                 sender_nick=msg['nick'],
@@ -229,15 +240,28 @@ class ChatScreen(BaseScreen):
                 text_color=msg['text_color']
             )
 
-    def push_chat_message(self, sender_nick, text, timestamp, sender_color=16, text_color=0):
+    def push_chat_message(self, sender_nick, text, timestamp, sender_color=16, text_color=0, colon=True):
         """
         Formats and adds a persistent chat message to the buffer.
         """
         line = RichLine(is_chat=True)
-        line.add(25, f"[{timestamp}] ")
-        line.add(sender_color, f"{sender_nick}: ")
+        line.add(16, "[")
+        line.add(25, f"{timestamp}")
+        line.add(16, "][")
+        line.add(sender_color, f"{sender_nick}")
+        line.add(16, "]")
+        if colon:
+            line.add(16, ":")
+        else:
+            line.add(16, " ")
         line.add(text_color, text)
         self.logs.append(line)
+        
+        width = self.width - 1
+        wrapped = self._wrap_rich_line(line, width)
+        idx = len(self.logs) - 1
+        for segs in wrapped:
+            self.buffer.append({'index': idx, 'segments': segs})
 
     def push_system_log(self, text, color_id=25):
         """
@@ -247,6 +271,12 @@ class ChatScreen(BaseScreen):
         line = RichLine(is_chat=False)
         line.add(color_id, text)
         self.logs.append(line)
+        
+        width = self.width - 1
+        wrapped = self._wrap_rich_line(line, width)
+        idx = len(self.logs) - 1
+        for segs in wrapped:
+            self.buffer.append({'index': idx, 'segments': segs})
 
     def clear_non_chat(self):
         """
@@ -254,39 +284,109 @@ class ChatScreen(BaseScreen):
         """
         # Filter the list based on the is_chat flag in rich line
         self.logs = [line for line in self.logs if line.is_chat]
+        self._reflow_buffer()
         self.chat_scrl_off = 0
+
+    def _reflow_buffer(self):
+        self.buffer = []
+        width = self.width - 1
+        for i, log in enumerate(self.logs):
+            lines = self._wrap_rich_line(log, width)
+            for segs in lines:
+                self.buffer.append({'index': i, 'segments': segs})
+
+    def _wrap_rich_line(self, log, width):
+        lines = []
+        if not log.segments:
+            return lines
+        
+        prefix_segments = log.segments[:-1]
+        message_segment = log.segments[-1]
+        
+        prefix_len = sum(len(text) for _, text in prefix_segments)
+        
+        current_row = list(prefix_segments)
+        current_x = prefix_len
+        
+        color_id, message_text = message_segment
+        
+        for char in message_text:
+            if current_x >= width:
+                lines.append(current_row)
+                current_row = [(color_id, char)]
+                current_x = 1
+            else:
+                if current_row and current_row[-1][0] == color_id:
+                    c, t = current_row.pop()
+                    current_row.append((c, t + char))
+                else:
+                    current_row.append((color_id, char))
+                current_x += 1
+        
+        if current_row:
+            lines.append(current_row)
+        return lines
+
     # Drawing
     def draw(self):
         self.stdscr.clear()
         info = self.engine.get_status_bar_info()
-        # STATUS BAR
         self.draw_status_bar(info)
-        # CHAT LOG (Middle)
-        # slice logs
-        chat_height = self.height - 3
-        if self.chat_scrl_off > 0:
-            start_idx = -(chat_height + self.chat_scrl_off)
-            end_idx = -self.chat_scrl_off
-            visible_logs = self.logs[max(0, len(self.logs) + start_idx) : end_idx]
-        else:
-            visible_logs = self.logs[-chat_height:]
-        # draw visible logs
-        for y_offset, rich_line in enumerate(visible_logs):
-            y_pos = 1 + y_offset
-            if y_pos >= self.height - 1: break
-            current_x = 0
-            for color_id, text in rich_line.segments:
-                if current_x >= self.width - 1: break
-                try:
-                    # Draw each segment and update the X cursor
-                    self.stdscr.addstr(y_pos, current_x, text[:self.width-1-current_x], curses.color_pair(color_id))
-                    current_x += len(text)
-                except curses.error:
-                    pass
+
+        chat_width = self.width - 1
+        chat_height = self.height - 2
+        target = info['server'] if info['room'] == "GLOBAL" else info['room']
+        unread_count = info['notifications'].get(target, 0)
+        
+        separator_log_idx = len(self.logs) - unread_count if unread_count > 0 else -1
+        
+        view_lines = []
+        current_buf_idx = len(self.buffer) - 1 - self.chat_scrl_off
+        lines_collected = 0
+        
+        while current_buf_idx >= 0 and lines_collected < chat_height:
+            line_data = self.buffer[current_buf_idx]
+            idx = line_data['index']
+            segs = line_data['segments']
+            
+            view_lines.append(("MSG", segs))
+            lines_collected += 1
+            
+            if lines_collected >= chat_height:
+                break
+            
+            # Check for separator (inserted above the current line if it's the first line of the target message)
+            if unread_count > 0 and idx == separator_log_idx:
+                is_first_line = False
+                if current_buf_idx == 0:
+                    is_first_line = True
+                elif self.buffer[current_buf_idx - 1]['index'] != idx:
+                    is_first_line = True
+                
+                if is_first_line:
+                    view_lines.append(("SEPARATOR", unread_count))
+                    lines_collected += 1
+            
+            current_buf_idx -= 1
+            
+        view_lines.reverse()
+        
+        y_cursor = 1
+        for row_type, content in view_lines:
+            if y_cursor >= self.height - 1: break
+            if row_type == "SEPARATOR":
+                self.draw_unread_separator(y_cursor, unread_count)
+            else:
+                self.draw_wrapped_line(y_cursor, content)
+            y_cursor += 1
         # TAB OVERLAY (Draw on top if active)
         if self.show_list_overlay:
             self._draw_overlay(info)
         
+        # draw chat arrow
+        if self.chat_scrl_off > 0:
+            self.stdscr.addstr(self.height - 2, (self.width//2) - 3, "  vvv  ", curses.color_pair(5))
+
         # Draw PS1
         if info['server'] == "NONE":
             conn_col = 8
@@ -295,14 +395,17 @@ class ChatScreen(BaseScreen):
         text = self.input_box.get_text()
         bash_col = self.bash_to_col(text)
         self.input_box.prompt = f"{info['nick']}@freq # "
-        self.input_box.draw(self.stdscr, self.height - 2, 0, self.width, ps1_colors=[13,conn_col,4,bash_col])
+        self.input_box.draw(self.stdscr, self.height - 1, 0, self.width, ps1_colors=[13,conn_col,4,bash_col])
 
     def bash_to_col(self, text):
         #command dictionary
         valid_cmds = [
             "/friend","/join","/leave","/nick","/del","/file","/ft","/connect",
-            "/c","/disconnect","/clean","/server","/s","/n","/exit","/policy","/dc"
+            "/c","/disconnect","/clean","/server","/s","/n","/exit","/policy","/dc",
+            "/refresh","/r","/default","/proxy", "/quit", "/q"
         ]
+        if text.startswith("/file ") or text.startswith("/ft "):
+            return 5
         if not text.startswith("/"):
             return 13
         parts = text.split(" ", 1)
@@ -355,6 +458,22 @@ class ChatScreen(BaseScreen):
         except curses.error:
             pass
 
+    def draw_unread_separator(self, y, count):
+        """ draws --- Unread (count) ------"""
+        label = f" ---------- Unread ({count}) "
+        bar = label.ljust(self.width - 1, "-")
+        try:
+            self.stdscr.addstr(y, 0, bar, curses.color_pair(5))
+        except curses.error: pass
+
+    def draw_wrapped_line(self, y, segments):
+        current_x = 0
+        for color_id, text in segments:
+            try:
+                self.stdscr.addstr(y, current_x, text, curses.color_pair(color_id))
+                current_x += len(text)
+            except curses.error: pass
+
     def _draw_overlay(self, info):
         """Helper to draw the Server/Alias list popup with scrolling"""
         # Dimensions
@@ -381,6 +500,7 @@ class ChatScreen(BaseScreen):
             # Current status info
             current_server = info['server']
             current_room = info['room']
+            notifications = info['notifications']
             server_link_list = links.get(current_server, []) # List of aliases linked to active server
 
             # Slicing the lists based on scroll offset
@@ -396,7 +516,7 @@ class ChatScreen(BaseScreen):
             for i, (name, url) in enumerate(server_items):
                 is_active = (name == current_server)
                 if is_active:
-                    color = curses.color_pair(14)
+                    color = curses.color_pair(15)
                     prefix = "@ "
                 else:
                     color = curses.color_pair(8)
@@ -405,25 +525,36 @@ class ChatScreen(BaseScreen):
                 txt = f"{prefix}{name}"
                 # Truncate to avoid overlapping columns
                 self.stdscr.addstr(sy+3+i, sx+2, txt[:(w//2)-4], color)
+                if name in notifications:
+                    if notifications[name] > 0:
+                        #print notification indicator
+                        self.stdscr.addstr(sy+3+i, sx+3+len(txt[:(w//2)-4]), f"*{str(notifications[name])}", curses.color_pair(10))
 
             # Aliases
+            in_dm = current_room != "GLOBAL"
             for i, name in enumerate(alias_items):
                 is_dm = (name == current_room)
-                is_linked = name in server_link_list
-                
-                if is_dm:
-                    prefix = " > "
-                    color = curses.color_pair(7)
-                elif is_linked:
+                is_linked = aliases_dict[name] in server_link_list
+                online = aliases_dict[name] in self.engine.peers
+                if is_linked:
                     prefix = " - "
-                    color = curses.color_pair(12)
+                    if in_dm and not is_dm:
+                        #linked but not target
+                        color = curses.color_pair(12) | curses.A_DIM
+                    else:
+                        #target
+                        color = curses.color_pair(12)
                 else:
                     prefix = "   "
                     color = curses.color_pair(8)
 
-                txt = f"{prefix}{name}"
-                # Truncate to avoid bleeding off the right edge
-                self.stdscr.addstr(sy+3+i, mid_x+2, txt[:(w//2)-4], color)
+                pcolor = 12 if online else 8
+                self.stdscr.addstr(sy+3+i, mid_x+2, prefix, curses.color_pair(pcolor))
+                self.stdscr.addstr(sy+3+i, mid_x+5, name[:(w//2)-8], color)
+                if name in notifications:
+                    if notifications[name] > 0:
+                        #print notification indicator
+                        self.stdscr.addstr(sy+3+i, mid_x+6+len(name[:(w//2)-8]), f"*{str(notifications[name])}", curses.color_pair(10))
 
             # Scroll indicator
             if can_go_up:
@@ -432,6 +563,9 @@ class ChatScreen(BaseScreen):
                 self.stdscr.addstr(sy + h - 1, mid_x - 2, " vvv ", curses.color_pair(8) | curses.A_REVERSE)
 
         except curses.error:
+            pass
+        except Exception as e:
+            logging.debug(f"draw_overlay crashed:{e}")
             pass
 
     def print_banner(self):
@@ -469,7 +603,8 @@ class ChatScreen(BaseScreen):
                     self.menu_scrl_off -= 1
             else:
             #chat scroll
-                if self.chat_scrl_off < len(self.logs) - (self.height - 3):
+                max_scroll = max(0, len(self.buffer) - (self.height - 2))
+                if self.chat_scrl_off < max_scroll:
                     self.chat_scrl_off += 1
         elif key == curses.KEY_DOWN:
             if self.show_list_overlay:
@@ -507,7 +642,10 @@ class ConfigScreen(BaseScreen):
         my_id = self.engine.vault.get_my_identity_hex() if self.engine.vault else "LOCKED"
         profile = self.engine.profile_cache
         info = self.engine.get_status_bar_info()
+        # Parse Data
+        #version
         ver = getattr(self.engine, 'ptver', '!!!')
+        #connection
         if info['tor']:
             if info['server'] != "NONE":
                 #Connected
@@ -519,11 +657,52 @@ class ConfigScreen(BaseScreen):
                 proxy_status = "Avaliable"
         else:
             #Disconnected/Unavaliable
-            proxy_status_color = curses.color_pair(0)
+            proxy_status_color = curses.color_pair(8)
             proxy_status = "Unavaliable"
+        if len(info['peers']) > 0:
+            peer_count = len(info['peers']) - 1
+        else:
+            peer_count = 0
+        #policies
+        mpolicy = profile.get("msg_policy", {})
+        fpolicy = profile.get("file_policy", {})
+        mgpolicy = mpolicy.get("mode", "deny")
+        fgpolicy = fpolicy.get("mode", "deny")
+        limit = profile.get("max_msg_size", 1000000)
+        str_file_policy = fgpolicy.upper()
+        str_msg_policy = mgpolicy.upper()
+
+        if fgpolicy == "allow":
+            file_policy_color = curses.color_pair(12)
+            exceptions = len(fpolicy.get("blacklist", []))
+            if exceptions > 0:
+                str_file_policy += f" (!{exceptions})"
+        elif fgpolicy == "whitelist":
+            file_policy_color = curses.color_pair(16)
+            exceptions = len(fpolicy.get("whitelist", []))
+            if exceptions > 0:
+                str_file_policy += f" ({exceptions})"
+        else:
+            file_policy_color = curses.color_pair(9)
+        if mgpolicy == "allow":
+            msg_policy_color = curses.color_pair(12)
+            exceptions = len(mpolicy.get("blacklist", []))
+            if exceptions > 0:
+                str_msg_policy += f" (!{exceptions})"
+        elif mgpolicy == "whitelist":
+            msg_policy_color = curses.color_pair(16)
+            exceptions = len(mpolicy.get("whitelist", []))
+            if exceptions > 0:
+                str_msg_policy += f" ({exceptions})"
+        else:
+            msg_policy_color = curses.color_pair(9)
+        
+        #directories
         ddir = profile.get('download_dir',"")
         if ddir == "":
             ddir = os.path.join(self.engine.get_home_dir(), "Downloads")
+        # PRINT
+        #PROFILE
         self.stdscr.addstr(1, 2, "PROFILE:", curses.A_BOLD)
         self.stdscr.addstr(2, 3, "  IDENT:", curses.color_pair(25))
         self.stdscr.addstr(2, 12, str(my_id), curses.color_pair(13))
@@ -533,24 +712,28 @@ class ConfigScreen(BaseScreen):
         self.stdscr.addstr(4, 12, str(len(profile.get('aliases', {}))), curses.color_pair(0))
         self.stdscr.addstr(5, 3, "SERVERS: ", curses.color_pair(25))
         self.stdscr.addstr(5, 12, str(len(profile.get('servers', {}))), curses.color_pair(0))
-
+        #NETWORK
         self.stdscr.addstr(6, 2, "NETWORK:", curses.A_BOLD)
         self.stdscr.addstr(7, 3, " STATUS:", curses.color_pair(25))
         self.stdscr.addstr(7, 12, proxy_status, proxy_status_color)
         self.stdscr.addstr(8, 3, "  PROXY:", curses.color_pair(25))
         self.stdscr.addstr(8, 12, profile.get('tor_proxy', 'Unknown'), curses.color_pair(15))
         self.stdscr.addstr(9, 3, "  PEERS:", curses.color_pair(25))
-        self.stdscr.addstr(9, 12, str(len(info['peers'])), curses.color_pair(0))
-
+        self.stdscr.addstr(9, 12, str(peer_count), curses.color_pair(0))
+        #POLICY
         self.stdscr.addstr(10, 2, " POLICY:", curses.A_BOLD)
-        #msg policy
-        #file policy
-        self.stdscr.addstr(13, 3, "     DL:", curses.color_pair(25))
-        self.stdscr.addstr(13, 12, ddir, curses.color_pair(0))
-
-        self.stdscr.addstr(14, 2, "  VAULT:", curses.A_BOLD)
-        self.stdscr.addstr(15, 3, "   PATH:", curses.color_pair(25))
-        self.stdscr.addstr(15, 12, self.engine._get_vault_path(), curses.color_pair(0))
+        self.stdscr.addstr(11, 3, "    MSG:", curses.color_pair(25))
+        self.stdscr.addstr(11, 12, str_msg_policy, msg_policy_color)
+        self.stdscr.addstr(12, 3, "   FILE:", curses.color_pair(25))
+        self.stdscr.addstr(12, 12, str_file_policy, file_policy_color)
+        self.stdscr.addstr(13, 3, "  LIMIT:", curses.color_pair(25))
+        self.stdscr.addstr(13, 12, f"{limit} bytes", curses.color_pair(0))
+        #PATHS
+        self.stdscr.addstr(14, 2, "  PATHS:", curses.A_BOLD)
+        self.stdscr.addstr(15, 3, "     DL:", curses.color_pair(25))
+        self.stdscr.addstr(15, 12, ddir, curses.color_pair(0))
+        self.stdscr.addstr(16, 3, "  VAULT:", curses.color_pair(25))
+        self.stdscr.addstr(16, 12, self.engine._get_vault_path(), curses.color_pair(0))
 
 
 
