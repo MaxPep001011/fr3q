@@ -133,6 +133,10 @@ class LockScreen(BaseScreen):
             self.msg = "ACCOUNT NAME REQUIRED"
             self.focus_box = self.name_box
             return 0
+        if name == "GLOBAL":
+            self.msg = "NAME 'GLOBAL' RESERVED"
+            self.focus_box = self.name_box
+            return 0
         if re.search(r'[^a-zA-Z0-9_-]', name):
             self.msg = "NAME CANNOT HAVE SPACES OR SPECIAL CHARS"
             self.focus_box = self.name_box
@@ -209,7 +213,9 @@ class ChatScreen(BaseScreen):
         self.chat_scrl_off = 0
         self.menu_scrl_off = 0
         self.input_box = TextInput(prompt=">> ", draw_cursor=True)
-        self.show_list_overlay = False
+        self.show_overlay = False
+        self.active_overlay = None
+        self.overlay_args = {}
         self.print_banner()
         self._reflow_buffer()
 
@@ -237,7 +243,8 @@ class ChatScreen(BaseScreen):
                 text=msg['text'],
                 timestamp=msg['time'],
                 sender_color=msg['sender_color'],
-                text_color=msg['text_color']
+                text_color=msg['text_color'],
+                colon=msg['colon']
             )
 
     def push_chat_message(self, sender_nick, text, timestamp, sender_color=16, text_color=0, colon=True):
@@ -285,6 +292,11 @@ class ChatScreen(BaseScreen):
         # Filter the list based on the is_chat flag in rich line
         self.logs = [line for line in self.logs if line.is_chat]
         self._reflow_buffer()
+        self.chat_scrl_off = 0
+
+    def clear_logs(self):
+        self.logs = []
+        self.buffer = []
         self.chat_scrl_off = 0
 
     def _reflow_buffer(self):
@@ -338,7 +350,22 @@ class ChatScreen(BaseScreen):
         target = info['server'] if info['room'] == "GLOBAL" else info['room']
         unread_count = info['notifications'].get(target, 0)
         
-        separator_log_idx = len(self.logs) - unread_count if unread_count > 0 else -1
+        separator_log_idx = -1
+        if unread_count > 0:
+            # Scan backwards from the end of self.logs to find the index of the Nth "real" message.
+            # This correctly places the separator above chat messages, skipping over any join/left messages.
+            logs_to_scan = reversed(list(enumerate(self.logs)))
+            real_messages_found = 0
+            for idx, log in logs_to_scan:
+                # A real message has a ':' segment (chat) or uses color 7 (file). 
+                # A join/left message has neither.
+                is_real_message = any(seg[1] == ":" or seg[0] == 7 for seg in log.segments)
+                if is_real_message:
+                    real_messages_found += 1
+                
+                if real_messages_found >= unread_count:
+                    separator_log_idx = idx
+                    break
         
         view_lines = []
         current_buf_idx = len(self.buffer) - 1 - self.chat_scrl_off
@@ -370,7 +397,8 @@ class ChatScreen(BaseScreen):
             current_buf_idx -= 1
             
         view_lines.reverse()
-        
+
+        # Draw logs
         y_cursor = 1
         for row_type, content in view_lines:
             if y_cursor >= self.height - 1: break
@@ -379,14 +407,23 @@ class ChatScreen(BaseScreen):
             else:
                 self.draw_wrapped_line(y_cursor, content)
             y_cursor += 1
+        # Draw Transfer Progress (if any)
+        if info.get("transfers"):
+            self.draw_transfers(info["transfers"])
         # TAB OVERLAY (Draw on top if active)
-        if self.show_list_overlay:
-            self._draw_overlay(info)
-        
+        if self.show_overlay:
+            if self.active_overlay in (None, "lists"):
+                self.draw_lists(info)
+            elif self.active_overlay == "whois":
+                key = self.overlay_args.get("key")
+                alias = self.overlay_args.get("alias", None)
+                self.draw_whois(key, alias)
+            elif self.active_overlay == "who":
+                self.draw_who()
+            
         # draw chat arrow
         if self.chat_scrl_off > 0:
             self.stdscr.addstr(self.height - 2, (self.width//2) - 3, "  vvv  ", curses.color_pair(5))
-
         # Draw PS1
         if info['server'] == "NONE":
             conn_col = 8
@@ -402,7 +439,7 @@ class ChatScreen(BaseScreen):
         valid_cmds = [
             "/friend","/join","/leave","/nick","/del","/file","/ft","/connect",
             "/c","/disconnect","/clean","/server","/s","/n","/exit","/policy","/dc",
-            "/refresh","/r","/default","/proxy", "/quit", "/q"
+            "/refresh","/r","/default","/proxy", "/quit", "/q", "/whois", "/who"
         ]
         if text.startswith("/file ") or text.startswith("/ft "):
             return 5
@@ -414,6 +451,35 @@ class ChatScreen(BaseScreen):
             return 12
         return 10
 
+    def draw_transfers(self, transfers):
+        # top right, below status bar
+        row = 1
+        for _, t in transfers.items():
+            if row > 3: break # Max 3 bars
+            pct = int((t['current'] / t['total']) * 100) if t['total'] > 0 else 0
+            
+            c_main = 21 if t['type'] == "TX" else 20 # 13=Cyan(TX), 12=Green(RX)
+            name = t['name']
+            if len(name) > 10: name = name[:8] + ".."
+            
+            bar_len = 20
+            filled = int((pct / 100) * bar_len)
+            
+            segments = []
+            segments.append((c_main, f" {t['type']} "))
+            segments.append((16, f"{name} "))
+            segments.append((8, "["))
+            segments.append((c_main, " " * filled))
+            segments.append((25, " " * (bar_len - filled)))
+            segments.append((8, "] "))
+            segments.append((16, f"{pct}% "))
+
+            total_len = sum(len(s[1]) for s in segments)
+            start_x = self.width - total_len - 1
+            if start_x > 0:
+                self.draw_wrapped_line(row, segments, xOffset=start_x)
+            row += 1
+
     def draw_status_bar(self, info):
         try:
             ver_text = f" FR3Q (v{info['ver']}) "
@@ -421,8 +487,16 @@ class ChatScreen(BaseScreen):
             server_text = f"{info['server']} "
             num_peers = len(info['peers']) - 1 if info['peers'] else 0
             peers_text = f"({num_peers})"
-            
             status_box = f"  {info['status']}   "
+            noti_str = None
+
+            #Count notifications
+            total_notis = 0
+            for room in info['notifications']:
+                number = info['notifications'].get(room, 0)
+                total_notis += number
+            if total_notis > 0:
+                noti_str = f" *{str(total_notis)}"
             
             # resolve color
             if info['tor']:
@@ -448,6 +522,9 @@ class ChatScreen(BaseScreen):
             # peers
             self.stdscr.addstr(0, center_x + 1 + len(server_text), peers_text, base_color)
 
+            # notis
+            if noti_str:
+                self.stdscr.addstr(0, center_x + 1 + len(server_text) + len(peers_text), noti_str, curses.color_pair(28))
             # status bar
             start_x_status = self.width - len(status_box)
             if start_x_status > 0:
@@ -466,16 +543,15 @@ class ChatScreen(BaseScreen):
             self.stdscr.addstr(y, 0, bar, curses.color_pair(5))
         except curses.error: pass
 
-    def draw_wrapped_line(self, y, segments):
-        current_x = 0
+    def draw_wrapped_line(self, y, segments, xOffset=0):
+        current_x = xOffset
         for color_id, text in segments:
             try:
                 self.stdscr.addstr(y, current_x, text, curses.color_pair(color_id))
                 current_x += len(text)
             except curses.error: pass
 
-    def _draw_overlay(self, info):
-        """Helper to draw the Server/Alias list popup with scrolling"""
+    def draw_info_box(self):
         # Dimensions
         h, w = self.height - 4, self.width - 8
         sy, sx = 2, 4
@@ -489,7 +565,21 @@ class ChatScreen(BaseScreen):
                 if i not in (0, h - 1):
                     # content area
                     self.stdscr.addstr(sy+i, sx+1, " " * (w - 2), curses.color_pair(27))
-            
+        except curses.error:
+            pass
+        except Exception as e:
+            logging.debug(f"draw_info_box crashed:{e}")
+            pass
+
+    def draw_lists(self, info):
+        """Helper to draw the Server/Alias list popup with scrolling"""
+        # Dimensions
+        h, w = self.height - 4, self.width - 8
+        sy, sx = 2, 4
+        max_view_rows = h - 4 
+        self.draw_info_box()
+
+        try:
             servers_dict = self.engine.profile_cache.get('servers', {})
             aliases_dict = self.engine.profile_cache.get('aliases', {})
             links = self.engine.profile_cache.get('server_links', {})
@@ -536,18 +626,17 @@ class ChatScreen(BaseScreen):
                 is_dm = (name == current_room)
                 is_linked = aliases_dict[name] in server_link_list
                 online = aliases_dict[name] in self.engine.peers
+                key = aliases_dict[name]
+                color = curses.color_pair(self.engine.ident_color(key))
                 if is_linked:
                     prefix = " - "
+                    color = curses.color_pair(12)
                     if in_dm and not is_dm:
                         #linked but not target
-                        color = curses.color_pair(12) | curses.A_DIM
-                    else:
-                        #target
-                        color = curses.color_pair(12)
+                        color = curses.color_pair(4) if online else curses.color_pair(25)
                 else:
+                    color = curses.color_pair(25)
                     prefix = "   "
-                    color = curses.color_pair(8)
-
                 pcolor = 12 if online else 8
                 self.stdscr.addstr(sy+3+i, mid_x+2, prefix, curses.color_pair(pcolor))
                 self.stdscr.addstr(sy+3+i, mid_x+5, name[:(w//2)-8], color)
@@ -565,8 +654,104 @@ class ChatScreen(BaseScreen):
         except curses.error:
             pass
         except Exception as e:
-            logging.debug(f"draw_overlay crashed:{e}")
+            logging.debug(f"draw_lists crashed:{e}")
             pass
+
+    def draw_whois(self, key: str, alias: str=None):
+        # Dimensions
+        h, w = self.height - 4, self.width - 8
+        sy, sx = 2, 4
+        max_view_rows = h - 4
+        self.draw_info_box()
+        aliases_dict = self.engine.profile_cache.get('aliases', {})
+        links = self.engine.profile_cache.get('server_links', {})
+        if alias:
+            #is alias
+            target = alias
+        else:
+            #not alias
+            target = key
+        try:
+            mid_x = sx + w//2
+            msg_policy = "ALLOW" if self.engine.rule_query(0x01, key) else "DENY"
+            file_policy = "ALLOW" if self.engine.rule_query(0x02, key) else "DENY"
+            session_status = "True" if self.engine.vault.has_session(bytes.fromhex(key)) else "False"
+            key_color = self.engine.ident_color(key)
+            status = ""
+            if key_color == 15:
+                status = "ONLINE, BLOCKED"
+            elif key_color == 9:
+                status = "OFFLINE, BLOCKED"
+            elif key_color in (12, 11):
+                status = "ONLINE"
+            elif key_color in (25, 2):
+                status = "OFFLINE"
+            elif key_color == 13:
+                status = "YOU"
+            #title
+            self.stdscr.addstr(sy+2, mid_x-(len(target)//2), target, curses.color_pair(key_color) | curses.A_BOLD)
+            sy += 1
+            self.stdscr.addstr(sy+3, mid_x-(len(status)//2), status, curses.color_pair(25))
+            sy += 1
+            #info
+            self.stdscr.addstr(sy+4, sx+2, "  KEY: ", curses.color_pair(25))
+            self.stdscr.addstr(sy+4, sx+9, key, curses.color_pair(key_color))
+            self.stdscr.addstr(sy+5, sx+2, "  MSG: ", curses.color_pair(25))
+            self.stdscr.addstr(sy+5, sx+9, msg_policy, curses.color_pair(12 if msg_policy == "ALLOW" else 9))
+            self.stdscr.addstr(sy+6, sx+2, " FILE: ", curses.color_pair(25))
+            self.stdscr.addstr(sy+6, sx+9, file_policy, curses.color_pair(12 if file_policy == "ALLOW" else 9))
+            self.stdscr.addstr(sy+7, sx+2, " SESH: ", curses.color_pair(25))
+            self.stdscr.addstr(sy+7, sx+9, session_status, curses.color_pair(8))
+
+            self.stdscr.addstr(sy+9, sx+2, " SEEN: ", curses.color_pair(25))
+            i = 0
+            for server in links:
+                llist = links[server]
+                if key in llist and sy+10+i < h:
+                    self.stdscr.addstr(sy+10+i, sx+9, server, curses.color_pair(8))
+                    i += 1
+
+        except curses.error:
+            pass
+        except Exception as e:
+            logging.debug(f"draw_whois crashed:{e}")
+            pass
+
+    def draw_who(self):
+        # Dimensions
+        h, w = self.height - 4, self.width - 8
+        sy, sx = 2, 4
+        max_view_rows = h - 4
+        self.draw_info_box()
+        peers = self.engine.peers
+        aliases = self.engine.profile_cache.get('aliases', {})
+        server = self.engine.current_server_name
+        try:
+            mid_x = sx + w//2
+            if server:
+                self.stdscr.addstr(sy+2, mid_x-(len(server)//2), server, curses.A_BOLD)
+            else:
+                self.stdscr.addstr(sy+2, mid_x-3, " NONE ", curses.A_BOLD)
+            if peers:
+                i = 0
+                for peer in peers:
+                    ident_color = self.engine.ident_color(peer)
+                    for name in aliases:
+                        key = aliases[name]
+                        if key == peer:
+                            peer += f" ({name})"
+                    if sy+4+i < h:
+                        self.stdscr.addstr(sy+4+i, sx+2, "- " + peer, curses.color_pair(ident_color))
+                    i += 1
+            else:
+                self.stdscr.addstr(sy+4, mid_x-3, " NONE ", curses.color_pair(25))
+        except curses.error:
+            pass
+        except Exception as e:
+            logging.debug(f"draw_who crashed:{e}")
+            pass
+
+
 
     def print_banner(self):
         chunks = [
@@ -589,15 +774,16 @@ class ChatScreen(BaseScreen):
             self.logs.append(row_line)
     # Input
     def handle_input(self, key):
-        # 1. Check for Overlays/Screens first
+        # Check for Overlays/Screens
         if key == 9: # Tab
-            self.show_list_overlay = not self.show_list_overlay
+            self.show_overlay = not self.show_overlay
+            self.active_overlay = None
             return
         if key == 27: # ESC
             return ConfigScreen(self.stdscr, self.engine)
         #Scrolling
         if key == curses.KEY_UP:
-            if self.show_list_overlay:
+            if self.show_overlay:
                 #overlay scroll
                 if self.menu_scrl_off > 0:
                     self.menu_scrl_off -= 1
@@ -607,13 +793,15 @@ class ChatScreen(BaseScreen):
                 if self.chat_scrl_off < max_scroll:
                     self.chat_scrl_off += 1
         elif key == curses.KEY_DOWN:
-            if self.show_list_overlay:
-                num_servers = len(self.engine.profile_cache.get('servers', {}))
-                num_aliases = len(self.engine.profile_cache.get('aliases', {}))
-                max_items = max(num_servers, num_aliases)
-                #overlay scroll
-                if self.menu_scrl_off < max_items - (self.height - 8):
-                    self.menu_scrl_off += 1
+            if self.show_overlay:
+                #overlay type
+                if self.active_overlay in (None, "lists"):
+                    num_servers = len(self.engine.profile_cache.get('servers', {}))
+                    num_aliases = len(self.engine.profile_cache.get('aliases', {}))
+                    max_items = max(num_servers, num_aliases)
+                    #overlay scroll
+                    if self.menu_scrl_off < max_items - (self.height - 8):
+                        self.menu_scrl_off += 1
             else:
                 #chat scroll
                 if self.chat_scrl_off > 0:

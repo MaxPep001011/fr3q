@@ -24,6 +24,7 @@ class App:
     #                                   25 = DARK GREY
     #                                   26 = BLACK
     #                                   27 = CLR on CLR
+    #                                   28 = O on DARK GREY
     def __init__(self, engine):
         self.engine = engine
         self.current_screen = None
@@ -67,6 +68,7 @@ class App:
             curses.init_pair(25, 8, -1)
             curses.init_pair(26, 16, -1)
             curses.init_pair(27, -1, -1)
+            curses.init_pair(28, 202, 8)
         except curses.error:
             pass
 
@@ -154,9 +156,27 @@ class App:
                             if cmd == "clean_logs":
                                 if hasattr(self.current_screen, 'clear_non_chat'):
                                     self.current_screen.clear_non_chat()
+                            if cmd == "clear_logs":
+                                if hasattr(self.current_screen, 'clear_logs'):
+                                    self.current_screen.clear_logs()
                             if cmd == "refresh":
                                 if hasattr(self.current_screen, 'refresh_view'):
                                     self.current_screen.refresh_view(msg.get("data", []))
+                            if cmd == "whois":
+                                if hasattr(self.current_screen, 'draw_whois'):
+                                    key = msg.get("key")
+                                    alias = msg.get("alias")
+                                    self.current_screen.active_overlay = "whois"
+                                    self.current_screen.overlay_args = {
+                                        "key": key,
+                                        "alias": alias
+                                    }
+                                    self.current_screen.show_overlay = True
+                            if cmd == "who":
+                                if hasattr(self.current_screen, 'draw_who'):
+                                    self.current_screen.active_overlay = "who"
+                                    self.current_screen.overlay_args = {}
+                                    self.current_screen.show_overlay = True
                     needs_redraw = True
             # Draw
             if needs_redraw or self.engine.status_msg != oldstatus:

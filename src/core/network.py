@@ -41,6 +41,7 @@ class NetworkManager:
 
         #Debug only as it prints url to plaintext
         logging.debug(f"Connecting with Proxy {proxy_host}:{proxy_port}")
+        logging.info(f"Connecting...")
         sock = None
 
         try:
@@ -93,7 +94,7 @@ class NetworkManager:
 
     def stop(self):
         """Closes sockets and stops threads."""
-        self.is_connected = False
+        logging.info(f"Disconnecting...")
         self._shutdown_event.set()
         
         if self.socket:
@@ -103,9 +104,10 @@ class NetworkManager:
             except Exception:
                 pass
             self.socket = None
+        self.is_connected = False
         self.engine.peers = []
         self.engine.network = None
-        logging.info("Network stopped")
+        logging.info("Disconnected")
 
 
     def send(self, data: bytes):

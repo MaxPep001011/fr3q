@@ -1,9 +1,10 @@
 # ===================================================================================================================
 # ===================================================  Version  =====================================================
 # ===================================================================================================================
-ptversion = "0.1.02"
+ptversion = "0.1.07"
 
-MAX_INBOX_SIZE = 10*1024*1024 #10MB storage (queue + prekey storage)
+MAX_INBOX_SIZE = 100 * 1024 * 1024 # 100MB storage (queue + prekey storage)
+MAX_FRAME_SIZE = 5 * 1024 * 1024 #  5MB limit per frame (RAM safety)
 
 import os
 import shutil
@@ -82,8 +83,16 @@ def pack_frame(msg_type, recipient_bytes, sender_bytes, timestamp, header_bytes,
 
 def send_client_list(clients):
     """Broadcasts all connected Identity Keys (Hex) to all clients"""
-    client_list = list(clients.keys())
-    data = json.dumps(client_list).encode("utf-8")
+    # This prevents network flooding during file transfers.
+    base_delay_ms = 700
+    client_penalty_ms = len(clients) * 100
+    rate_limit_ms = base_delay_ms + client_penalty_ms
+
+    payload = {
+        "peers": list(clients.keys()),
+        "rate_limit_ms": rate_limit_ms
+    }
+    data = json.dumps(payload).encode("utf-8")
     
     # Empty header for system messages
     header = b"{}"
@@ -115,20 +124,25 @@ def client_handler(conn, addr, clients):
         head_raw = recv_exact(conn, HEADER_SIZE)
         if not head_raw: return
         msg_type, recip_bytes, sender_bytes, ts, h_len, d_len = struct.unpack(HEADER_FMT, head_raw)
+        
+        # Memory DoS Protection
+        if h_len + d_len > MAX_FRAME_SIZE:
+            print(f"{s_timestamp()}[-] {addr} tried to send oversize frame ({h_len+d_len} bytes), closing connection")
+            return
+
         h_data = recv_exact(conn, h_len) if h_len > 0 else b""
+        if h_data is None: return
         d_data = recv_exact(conn, d_len) if d_len > 0 else b""
+        if d_data is None: return
         
         my_ident_hex = sender_bytes.hex()
         if my_ident_hex:
-            clients[my_ident_hex] = conn
-            # Send updated client list
-            send_client_list(clients)
-            # Save prekeys
             if msg_type == 0x00 and not d_data == b"NONE":
                 storage.save_bundle(my_ident_hex, d_data)
                 print(f"{s_timestamp()}[+] STORED PREKEYS")
 
             print(f"{s_timestamp()}[+] {my_ident_hex} joined")
+            
             # Send missed messages
             offline_msgs = storage.flush_inbox(my_ident_hex)
             for m in offline_msgs:
@@ -136,14 +150,33 @@ def client_handler(conn, addr, clients):
             if offline_msgs:
                 print(f"{s_timestamp()}[+] Delivered {len(offline_msgs)} offline messages to {my_ident_hex[:8]}..")
             
+            # Now register client (Enable live routing)
+            clients[my_ident_hex] = conn
+            
+            # check for race condition stragglers
+            stragglers = storage.flush_inbox(my_ident_hex)
+            for m in stragglers:
+                conn.sendall(m)
+
+            # Send updated client list
+            send_client_list(clients)
+
             # Routing loop
             while my_ident_hex:
                 head_raw = recv_exact(conn, HEADER_SIZE)
                 if not head_raw: break
 
                 msg_type, recip_bytes, sender_bytes, ts, h_len, d_len = struct.unpack(HEADER_FMT, head_raw)
+
+                # Memory dos prevention
+                if h_len + d_len > MAX_FRAME_SIZE:
+                    print(f"{s_timestamp()}[!] {sender_hex[:8]} sent oversize frame ({h_len+d_len} bytes), closing connection")
+                    break
+
                 h_data = recv_exact(conn, h_len) if h_len > 0 else b""
+                if h_data is None: break
                 d_data = recv_exact(conn, d_len) if d_len > 0 else b""
+                if d_data is None: break
                 
                 sender_hex = sender_bytes.hex()
                 recip_hex = recip_bytes.hex()
@@ -260,6 +293,7 @@ def main():
     server.listen()
     print(f"              + Listening on {ip}:{lport}")
     print(f"\n{s_timestamp()}[+] Server started, url found at /var/lib/tor/hidden_service/hostname")
+    print(f"{s_timestamp()}[i] Stop with ctrl + C")
 
     
 

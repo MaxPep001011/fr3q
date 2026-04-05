@@ -16,11 +16,12 @@ from core.network import NetworkManager
 HEADER_FMT = ">B32s32sQII" # Type, Recip, Sender, HeadLen, DataLen
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
 CHAT_LOG_LENGTH = 50 #how many log entries to display upon refresh
+FILE_CHUNK_SIZE = 1024 * 512 # 512KB chunks
 
 class Engine:
     """
     The Controller.
-    Bridge between the Curses UI (View), the Rust Vault (Model), and the Network.
+    Bridges a UI, Vault, and a Network
     """
 
     def __init__(self, sys_config, Version: str):
@@ -36,8 +37,10 @@ class Engine:
         self.peers = []
         self.current_server_name: str = None # Name of server, None = not in a server
         self.current_room_key: str = None # None = lobby, Hex String = dm with alias
+        self.server_rate_limit_ms = 50 # Default chunk sending delay (ms)
         self.pending_hs = {}
         self.notifications = {}
+        self.initial_sync = False # Flag for processing offline messages
         # Events for UI to handle
         self.ui_queue = queue.Queue()
         # State Cache (Read from Vault) JSON
@@ -61,6 +64,11 @@ class Engine:
         }
         # Network Buffering
         self._packet_buffer = b""
+        # File Reassembly: { file_id (str): { "path": str, "total": int, "current": int, "name": str } }
+        self.file_transfers = {}
+        # UI Progress Tracking: { id: { "type": "TX"|"RX", "name": str, "current": int, "total": int } }
+        self.transfer_progress = {}
+        self.transfer_lock = threading.Lock()
 
     # STD functions
 
@@ -227,6 +235,16 @@ class Engine:
             logging.error(f"Connection Failed: {e}")
             self.status_msg = "FAILED"
     
+    def disconnect(self):
+        if self.network:
+            self.status_msg = "DISCONNECTING"
+            self.network.stop()
+            my_bytes = bytes.fromhex(self.vault.get_my_identity_hex())
+            self.push_chat_ui(self.get_tid(), my_bytes, "Left", time.time(), False, False)
+            self.status_msg = "DISCONNECTED"
+        self.current_room_key = None
+        self.current_server_name = None
+
     def me(self, ident_hex: str):
         """ Ret true if ident_hex belongs to this client """
         return ident_hex.lower() == self.vault.get_my_identity_hex()
@@ -240,9 +258,7 @@ class Engine:
         """
         Securely clears memory references to the Vault and Profile.
         """
-        if self.network:
-            self.network.stop()
-        
+        self.disconnect()
         if self.vault:
             try:
                 self.vault.save()
@@ -319,6 +335,23 @@ class Engine:
         else:
             return False
 
+    def ident_color(self, key: str, forceOnline=False):
+        if self.me(key):
+            return 13
+        online = key in self.peers
+        blocked = not self.rule_query(0x01, key)
+        aliased = self.vault.is_alias(key)
+        #logging.debug(f"key: {key[:8]}, online: {online}, blocked: {blocked}, aliased: {aliased}")
+        if forceOnline:
+            online = True
+        if blocked:
+            return 15 if online else 9
+        else:
+            if online:
+                return 12 if aliased else 11
+            else:
+                return 25 if aliased else 2
+
     def set_max_msg_size(self, sizestr: str):
         size = None
         try:
@@ -360,7 +393,7 @@ class Engine:
         else:
             #dm reset notifications
             alias = self.vault.get_contact_name(self.current_room_key)
-            if alias is not None:
+            if self.vault.is_alias(self.current_room_key) and alias is not None:
                 self.notifications[alias] = 0
             #could not find alias
 
@@ -395,6 +428,8 @@ class Engine:
         Handles incoming data and updates state.
         """
         if not self.network:
+            if self.status_msg == "CONNECTED":
+                self.status_msg = "DISCONNECTED"
             return
         # Buffer network data
         try:
@@ -512,10 +547,10 @@ class Engine:
                             if self.current_room_key == target_hex:
                                 self.current_room_key = None
                                 self.ui_queue.put("room_changed")
-                            # Wipe session/chat logs
-                            if self.vault.delete_session(target_hex):
-                                self.vault.log("INFO", f"Deleted session/history for alias '{alias}'")
-                            logging.debug(f"Deleted session/hist {alias}")
+                            # Wipe session/chat logs (TODO: do /wipe to do this)
+                            #if self.vault.delete_session(target_hex):
+                            #    self.vault.log("INFO", f"Deleted session/history for alias '{alias}'")
+                            #logging.debug(f"Deleted session/hist {alias}")
                         except Exception as e:
                             self.vault.log("ERROR", f"Session wipe for '{alias}' failed: {e}")
                             logging.error(f"Session wipe failed: {e}")
@@ -549,6 +584,7 @@ class Engine:
                             num_keys = 0
                         self.status_msg = "CONNECTING"
                         logging.debug(f"Starting connection thread for {server_name}")
+                        self.initial_sync = True
                         threading.Thread(
                             target=self.connect_to_server, 
                             args=(server_name, num_keys), 
@@ -559,18 +595,43 @@ class Engine:
                 else:
                     self.ui_queue.put({"print": "[i] Usage: /connect <server> [<key_amount>]"})
             elif cmd in ("/disconnect", "/dc"):
-                if self.network:
-                    self.status_msg = "DISCONNECTING"
-                    self.network.stop()
-                    my_bytes = bytes.fromhex(self.vault.get_my_identity_hex())
-                    self.push_chat_ui(self.get_tid(), my_bytes, "Left", time.time(), False, False)
-                    self.status_msg = "DISCONNECTED"
-                self.current_room_key = None
-                self.current_server_name = None
+                self.disconnect()
                 
+            elif cmd == "/whois":
+                if args:
+                    ident = args[0]
+                    key = self.vault.get_contact_pubhex(ident)
+                    if key:
+                        #ident is alias name
+                        alias = ident
+                        isalias = True
+                    else:
+                        #ident is key
+                        alias = self.vault.get_contact_name(ident)
+                        isalias = self.vault.is_alias(ident)
+                        if self.is_hex_key(ident):
+                            key = ident
+                        else:
+                            self.ui_queue.put({"print": f"[-] Ident '{ident}' could not be resolved to hex key"})
+                            return
+                    self.ui_queue.put({
+                        "command": "whois",
+                        "key": key,
+                        "alias": alias if isalias else None
+                    })
+                else:
+                    self.ui_queue.put({"print": "[i] Usage: /whois <ident>"})
+            elif cmd == "/who":
+                self.ui_queue.put({
+                    "command": "who"
+                })
             elif cmd == "/clean":
                 self.ui_queue.put({
                     "command": "clean_logs"
+                })
+            elif cmd in ("/clear","/clr"):
+                self.ui_queue.put({
+                    "command": "clear_logs"
                 })
             elif cmd in ("/refresh","/r"):
                 self.refresh_profile()
@@ -751,23 +812,85 @@ class Engine:
         if self.current_server_name is not None and self.network:
             if not os.path.exists(filepath):
                 self.vault.log("WARN", "File not found")
-                return
+                logging.debug(f"File '{filepath}' not found")
+                self.ui_queue.put({"print": f"[-] '{filepath}' not found"})
+            else:
+                recipients = self.choose_recipients()
+                if not recipients: return
 
-            recipients = self.choose_recipients()
-            if not recipients: return
+                # Chunking Logic
+                # Offload to background thread to prevent UI blocking
+                threading.Thread(target=self._bg_send_file, args=(filepath, recipients), daemon=True).start()
+                self.ui_queue.put({"print": f"[+] Sending '{os.path(filepath)}'"})
 
-            # "FILE:<path>" triggers file logic in Rust (this is stupid TODO: make file transfers work)
-            file_indicator = f"FILE:{filepath}"
+    def _bg_send_file(self, filepath, recipients):
+        """ Background worker for file sending """
+        file_id = None
+        try:
+            file_size = os.path.getsize(filepath)
+            filename = os.path.basename(filepath)
+            file_id = hashlib.md5(f"{filename}{time.time()}".encode()).hexdigest()[:16]
+            total_chunks = (file_size // FILE_CHUNK_SIZE) + (1 if file_size % FILE_CHUNK_SIZE != 0 else 0)
             ts = int(time.time())
-            packets = self.vault.send_multicast(recipients, file_indicator, ts)
             mtype = 0x2 if self.current_room_key is None else 0x12
+            
+            my_id_bytes = bytes.fromhex(self.vault.get_my_identity_hex())
+            
+            # Register Progress
+            with self.transfer_lock:
+                self.transfer_progress[file_id] = {
+                    "type": "TX", 
+                    "name": filename, 
+                    "current": 0, 
+                    "total": total_chunks
+                }
+            
+            # 1. Send Metadata (Start)
+            # OpCode 0x01 (Start) | JSON
+            meta = json.dumps({"id": file_id, "name": filename, "size": file_size, "chunks": total_chunks}).encode('utf-8')
+            payload = b"\x01" + meta
+            
+            # Encrypt Metadata
+            packets = self.vault.send_multicast(recipients, payload, ts)
             self._dispatch_packets(packets, mtype, ts)
 
+            # 2. Stream Chunks
+            # OpCode 0x02 (Data) | ID (16s) | Data
+            with open(filepath, "rb") as f:
+                chunk_seq = 0
+                while True:
+                    chunk = f.read(FILE_CHUNK_SIZE)
+                    if not chunk: break
+                    
+                    # Payload: OpCode(1) + FileID(16) + Data
+                    data_payload = b"\x02" + file_id.encode('utf-8') + chunk
+                    
+                    # Encrypt chunk (advances ratchet per chunk, secure and ordered)
+                    c_packets = self.vault.send_multicast(recipients, data_payload, ts)
+                    self._dispatch_packets(c_packets, mtype, ts)
+                    chunk_seq += 1
+                    
+                    # Update Progress
+                    with self.transfer_lock:
+                        if file_id in self.transfer_progress:
+                            self.transfer_progress[file_id]["current"] = chunk_seq
+                            self.ui_queue.put("update_progress")
+                    time.sleep(self.server_rate_limit_ms / 1000.0)
+
             # Log and show
-            my_id_bytes = bytes.fromhex(self.vault.get_my_identity_hex())
-            filename = os.path.basename(filepath)
-            self.vault.add_chat_log(self.get_tid(), my_id_bytes, ts, f"SENT '{filename}'", filepath)
-            self.push_chat_ui(self.get_tid(), my_id_bytes, f"SENT '{filename}'", ts, is_file=True)
+            self.vault.add_chat_log(self.get_tid(), my_id_bytes, ts, f"SENT '{filepath}'", filepath)
+            self.push_chat_ui(self.get_tid(), my_id_bytes, f"SENT '{filepath}'", ts, is_file=True)
+            
+        except Exception as e:
+            self.vault.log("ERROR", f"File send failed: {e}")
+            self.ui_queue.put({"print": f"[-] File send error: {e}"})
+        finally:
+            # Cleanup progress bar
+            if file_id:
+                with self.transfer_lock:
+                    if file_id in self.transfer_progress:
+                        del self.transfer_progress[file_id]
+
     #0x03 (0x00) (CLIENTS)
     def send_register_msg(self, num_keys: int = 50):
         """
@@ -804,7 +927,7 @@ class Engine:
 
             self.network.send(join_frame)
             self.vault.log("INFO", log_txt)
-            self.status_msg = "REGISTERING"
+            self.status_msg = "SYNCING"
         except Exception as e:
             self.vault.log("ERROR", f"Failed to register (send 0x03) on server: {e}")
     #0x04 (PREKEYS)
@@ -905,7 +1028,7 @@ class Engine:
                     # Pass the TS into the next stage
                     self.handle_net_buffer(msg_type, sender, header, data, ts)
                 else:
-                    vault.log("WARN", f"type {msg_type} from {sender.hex} blocked by policy")
+                    self.vault.log("WARN", f"type {msg_type} from {sender.hex} blocked by policy")
                     logging.debug(f"type {msg_type} from {sender.hex} blocked by policy")
                     if len(self._packet_buffer) < total_len:
                         break # Wait for more data
@@ -966,40 +1089,113 @@ class Engine:
     def handle_file(self, sender, header, data, ts, is_dm):
         sender_hex = sender.hex().lower()
         try:
-            # Standard receive (files are often encrypted just like chats)
-            #TODO: file transfers currently broken
             decrypted_bytes = self.vault.receive(sender, header, data, ts)
-            fpath = self.save_file(sender_hex, decrypted_bytes)
+            if not decrypted_bytes: return
             
-            if is_dm:
-                tid = self.get_tid(sender_hex)
-            else:
-                tid = self.get_tid(ident=None, force_global=True)
-            # Log and display
-            filename = os.path.basename(fpath)
-            display_text = f"SENT '{filename}'"
-            self.vault.add_chat_log(tid, sender, ts, display_text, fpath)
-            self.push_chat_ui(tid, sender, display_text, ts, is_file=True)
+            op_code = decrypted_bytes[0]
+            content = decrypted_bytes[1:]
             
+            # OpCode 0x01: Metadata / Start
+            if op_code == 0x01:
+                meta = json.loads(content.decode('utf-8'))
+                file_id = meta["id"]
+                
+                # Prep temp file in cache
+                cache_dir = os.path.join(self.get_home_dir(), ".cache", "fr3q", "temp")
+                os.makedirs(cache_dir, exist_ok=True)
+                temp_path = os.path.join(cache_dir, f"{file_id}.part")
+                
+                self.file_transfers[file_id] = {
+                    "path": temp_path,
+                    "total": meta["chunks"],
+                    "current": 0,
+                    "name": meta["name"]
+                }
+                # Clear previous temp if exists
+                with open(temp_path, "wb") as f:
+                    pass
+                
+                with self.transfer_lock:
+                    self.transfer_progress[file_id] = {
+                        "type": "RX", 
+                        "name": meta["name"], 
+                        "current": 0, "total": meta["chunks"]
+                    }
+                # Notify UI
+                if is_dm: tid = self.get_tid(sender_hex)
+                else: tid = self.get_tid(ident=None, force_global=True)
+                
+                display_text = f"SENT '{meta["name"]}'"
+                #self.vault.add_chat_log(tid, sender, ts, display_text, final_path)
+                self.push_chat_ui(tid, sender, display_text, ts, is_file=True)
+
+            # OpCode 0x02: Data Chunk
+            elif op_code == 0x02:
+                file_id = content[:16].decode('utf-8')
+                chunk_data = content[16:]
+                
+                if file_id in self.file_transfers:
+                    ft = self.file_transfers[file_id]
+                    with open(ft["path"], "ab") as f:
+                        f.write(chunk_data)
+                    ft["current"] += 1
+                    
+                    with self.transfer_lock:
+                        if file_id in self.transfer_progress:
+                            self.transfer_progress[file_id]["current"] = ft["current"]
+                            self.ui_queue.put("update_progress")
+
+                    # Check Completion
+                    if ft["current"] >= ft["total"]:
+                        # Move to Downloads
+                        final_path = self.save_file(sender_hex, ft["name"], ft["path"])
+                        del self.file_transfers[file_id]
+                        
+                        # Notify UI
+                        if is_dm: tid = self.get_tid(sender_hex)
+                        else: tid = self.get_tid(ident=None, force_global=True)
+                        
+                        display_text = f"SAVED '{final_path}'"
+                        self.vault.add_chat_log(tid, sender, ts, display_text, final_path)
+                        self.push_chat_ui(tid, sender, display_text, ts, is_file=True)
+                        
+                        with self.transfer_lock:
+                            if file_id in self.transfer_progress:
+                                del self.transfer_progress[file_id]
+
         except Exception as e:
-            logging.debug(f"type 0x01 file error: {e}")
-    def save_file(self, sender_hex, data):
+            logging.debug(f"type 0x02 file error: {e}")
+
+    def save_file(self, sender_hex, filename, temp_path):
         # Create a downloads folder in your config dir
         home = os.path.expanduser("~")
         download_path = os.path.join(home, "Downloads", "fr3q", self.current_server_name)
         os.makedirs(download_path, exist_ok=True)
-        # TODO:Generate a filename (using timestamp + sender for now)
-        filename = f"file_{int(time.time())}_{sender_hex[:8]}.bin"
+        
+        # Ensure unique name
         full_path = os.path.join(download_path, filename)
-        with open(full_path, "wb") as f:
-            f.write(data)
+        if os.path.exists(full_path):
+            base, ext = os.path.splitext(filename)
+            full_path = os.path.join(download_path, f"{base}_{int(time.time())}{ext}")
+            
+        os.rename(temp_path, full_path)
         return full_path
+        
     #0x03 (PEERS)
     def handle_list(self, jsonList):
         try:
             self.refresh_profile()
             old_set = set(self.peers) if self.peers else set()
-            new_list = json.loads(jsonList.decode("utf-8"))
+            
+            data = json.loads(jsonList.decode("utf-8"))
+            if isinstance(data, dict):
+                # New format: {"peers": [...], "rate_limit_ms": 50}
+                new_list = data.get("peers", [])
+                self.server_rate_limit_ms = data.get("rate_limit_ms", 50)
+            else:
+                # Old format: [...]
+                new_list = data
+
             new_set = set(new_list)
             links = self.profile_cache.get('server_links',{}).get(self.current_server_name, [])
             joined = new_set - old_set
@@ -1023,7 +1219,13 @@ class Engine:
 
             self.peers = new_list
             logging.debug(f"client list update:{str(new_list)}")
-            self.status_msg = "CONNECTED"
+            
+            
+            # If we are in the list, the server has finished sending offline msgs
+            if self.initial_sync and self.vault.get_my_identity_hex() in new_set:
+                self.initial_sync = False
+                self.status_msg = "CONNECTED"
+
             self.ui_queue.put("peer_list_update")
             
         except Exception as e:
@@ -1069,55 +1271,60 @@ class Engine:
             raw_msg = [(ts, text, "file" if is_file else None, sender)]
             
             formatted = self.format_logs(raw_msg, colon)[0]
-            self.clear_notis()
+            
+            # Only clear notifications if we are NOT in the middle of a sync
+            if not self.initial_sync:
+                self.clear_notis()
+
             self.ui_queue.put({"chat": formatted})
             logging.debug(f"Pushed msg to UI for TID: {tid.hex()}")
-        else:
-            # Background notification logic (TODO:fix so upon original joining of room, put unread bar at end by default)
-            if not self.me(sender_hex):
-                alias = self.vault.get_contact_name(sender_hex) or sender_hex[:8]
-                if tid == self.get_tid(None, True):
-                    #global notification (room)
-                    if self.current_server_name in self.notifications:
-                        #increment (name, int)
-                        self.notifications[self.current_server_name] += 1
-                    else:
-                        #create mapping and set to 1
-                        self.notifications[self.current_server_name] = 1
+        
+        # Background notification logic (OR syncing logic)
+        # We increment notifications if:
+        # 1. It's not me sending the message AND
+        # 2. (It's a background message OR we are currently syncing offline history) AND
+        # 3. It's a real message (indicated by `colon` OR `is_file`)
+        if not self.me(sender_hex) and (self.initial_sync or tid != current_view_tid) and (colon or is_file):
+            alias = self.vault.get_contact_name(sender_hex) or sender_hex[:8]
+            target = None
+            if tid == self.get_tid(None, True):
+                #global notification (room)
+                target = self.current_server_name
+            else:
+                #dm notification
+                target = alias
+            
+            if target:
+                if target in self.notifications:
+                    self.notifications[target] += 1
                 else:
-                    #dm notification
-                    if alias in self.notifications:
-                        #increment (name, int)
-                        self.notifications[alias] += 1
-                    else:
-                        #create mapping and set to 1
-                        self.notifications[alias] = 1
+                    self.notifications[target] = 1
                 self.ui_queue.put("notification")
-            logging.debug(f"Background msg for TID: {tid.hex()[:8]}.. (Current: {current_view_tid.hex()})")
+            
+            logging.debug(f"Background/Sync msg for TID: {tid.hex()[:8]}..")
     
     # MSG LOG
     def format_logs(self, raw_logs, colon=True):
         """Determines 'is_me' on the fly by comparing keys"""
         aliases = self.profile_cache.get("aliases", {})
         rev_aliases = {v.lower(): k for k, v in aliases.items()}
-        my_id_hex = self.vault.get_my_identity_hex().lower()
         
         formatted = []
         for ts, text, fpath, sender_raw in raw_logs:
             sender_hex = bytes(sender_raw).hex().lower()
             
-            is_me = (sender_hex == my_id_hex)
-            
+            is_me = self.me(sender_hex)
+            s_color = self.ident_color(sender_hex, True)
             if is_me:
                 name = self.profile_cache.get("nickname", "YOU")
-                s_color = 13 # Cyan
+                #s_color = 13 # Cyan
                 t_color = 8  # Light Grey
             else:
                 name = rev_aliases.get(sender_hex, False)
+                #s_color = 12 # Green
                 if not name:
                     name = f"{sender_hex[:8]}.."
-                    s_color = 11 # Yellow
-                s_color = 12 # Green
+                    #s_color = 11 # Yellow
                 t_color = 16 # White
 
             formatted.append({
@@ -1169,6 +1376,10 @@ class Engine:
             room = self.vault.get_contact_name(self.current_room_key)
         else:
             room = "GLOBAL"
+            
+        with self.transfer_lock:
+            active_transfers = self.transfer_progress.copy()
+            
         return {
             "status": self.status_msg,
             "room": room,
@@ -1177,5 +1388,6 @@ class Engine:
             "ver": self.ptver,
             "tor": self.tor_status(),
             "peers": self.peers,
-            "notifications": self.notifications # (name(str): amount(int))
+            "notifications": self.notifications, # (name(str): amount(int))
+            "transfers": active_transfers
         }

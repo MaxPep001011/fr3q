@@ -1,22 +1,16 @@
 #BUG: IP:
-#1. server shutdown updates client status to DISCONNECTED (sometimes) but client still shows purple @ and self.connected never changes to False???
 #2. polled vault logs do not have real timestamps
-#3. scroll offset does not increment correctly when chat logs wrap lines. implement line wrapping logic to account for wrapping 
-#4. prevent vault creation of reserved name "GLOBAL"
+#3. server side conn close client still thinks connected (color is white)
 #5. prevent duplicate connections (server should deny the duplicate tho leaves open for dos with spoofed header)
-#TODO: IP: 
-#1. add cmd to wipe stored messages for alias. also way to reset chat logs in vault.
-#2. add way to see the date of messages
-#3. add functionality for file/dir sending
-#4. add tab screen for /whois (alias or key)(no scroll)
-#5. add tab screen for /who (scroll)
-#6. add tab screen for vault log viewer (scroll)
-#7. add tab screen for policy viewing (scroll)
+#6. policy blocks do not update ratchet state (counts towards missed msgs)
+#7. file transfers are sometimes too quick for server to keep up for larger files. self.network returns None bc connection reset by server bc recv_exact ret none
+#8. Pn in ratchet not getting incremented EVER
+#
 #
 # ===================================================================================================================
 # ===================================================  Version  =====================================================
 # ===================================================================================================================
-ptversion = "0.1.02"
+ptversion = "0.1.07"
 
 import sys
 import argparse
@@ -36,6 +30,7 @@ def parse_args():
     return parser.parse_args()
 
 def main():
+    global ptversion
     args = parse_args()
 
     # Boot
@@ -58,6 +53,8 @@ def main():
 
     # Init engine
     try:
+        if args.debug:
+            ptversion += " DBG"
         engine = Engine(sys_config, ptversion)
         logging.info("Engine initialized.")
     except Exception as e:

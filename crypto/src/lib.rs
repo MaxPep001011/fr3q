@@ -222,6 +222,22 @@ impl PyVault {
             }
         }))
     }
+    fn is_alias(&self, alias_or_key: String) -> PyResult<bool> {
+        let v = self._get_inner()?;
+        if v.profile.aliases.contains_key(&alias_or_key) {
+            return Ok(true);
+        }
+        
+        let target_hex = alias_or_key.to_lowercase();
+        if let Ok(bytes) = hex::decode(&target_hex) {
+            if bytes.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&bytes);
+                return Ok(v.profile.aliases.values().any(|&k| k == arr));
+            }
+        }
+        Ok(false)
+    }
     //link key to server
     fn link_to_server(&mut self, ident_key: [u8; 32], server_name: String) -> PyResult<()> {
         let path = self.file_path.clone();
